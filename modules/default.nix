@@ -98,6 +98,16 @@ in
       default = "host";
       description = "Vision tower placement (VISION): host, fp8, bf16, or off.";
     };
+    draftQuant = mkOption {
+      type = types.nullOr (types.enum [ "fp4" "fp8" "bf16" ]);
+      default = "fp4";
+      description = ''
+        Draft (DFlash2) linear-layer precision (Q27_DRAFT_QUANT). `fp4` (NVFP4)
+        is the documented default: same speculative acceptance as `bf16` but
+        the fastest decode. Set to `null` to leave the variable unset (the
+        engine then uses its built-in default).
+      '';
+    };
     servedModelName = mkOption {
       type = types.str;
       default = "qwen3.8-27b";
@@ -263,7 +273,9 @@ in
           "${config.hardware.nvidia.package}/lib"
         ];
         Q27_LIB = "${cfg.engine}/lib/libq27.so";
-      } // (lib.optionalAttrs (cfg.gpuLockFile != null) {
+      } // (lib.optionalAttrs (cfg.draftQuant != null) {
+        Q27_DRAFT_QUANT = cfg.draftQuant;
+      }) // (lib.optionalAttrs (cfg.gpuLockFile != null) {
         ARCANE_GPU_LOCK = cfg.gpuLockFile;
       }) // cfg.extraEnv;
 
