@@ -23,11 +23,24 @@
             # tests fail with unraisable-exception warnings (environment-
             # dependent stdlib behavior, not a package defect; the same tests
             # pass under 3.14). Skip the check; the server only imports anyio.
-            # Must override per-Python package sets: `serve` pins python312, so
-            # the anyio that enters its closure is python312Packages.anyio, not
-            # the top-level (python3) anyio.
-            anyio = prev.anyio.override { doCheck = false; };
-            python312Packages.anyio = prev.python312Packages.anyio.override { doCheck = false; };
+            #
+            # Two gotchas:
+            #  - `.override { doCheck = false }` is a silent no-op here: the
+            #    nixpkgs anyio package function is { stdenv, lib,
+            #    buildPythonPackage, ... }: buildPythonPackage rec {...} —
+            #    `doCheck` isn't a named arg, so `makeOverridable` re-calls the
+            #    function and `doCheck` is dropped by `...`. The drv hash never
+            #    changes, so the check phase still runs and fails.
+            #    `overrideAttrs` patches the built derivation instead (the box's
+            #    own overlays/debugpy.nix uses this form) and is what actually
+            #    skips the tests.
+            #  - Must override per-Python package sets: `serve` pins python312,
+            #    so the anyio in its closure is python312Packages.anyio, not
+            #    the top-level (python3) anyio. The top-level one is overridden
+            #    too so the change propagates wherever default-python anyio is
+            #    used.
+            anyio = prev.anyio.overrideAttrs (oldAttrs: { doCheck = false; });
+            python312Packages.anyio = prev.python312Packages.anyio.overrideAttrs (oldAttrs: { doCheck = false; });
           })
         ];
       };
