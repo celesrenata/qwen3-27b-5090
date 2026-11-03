@@ -24,23 +24,29 @@
             # dependent stdlib behavior, not a package defect; the same tests
             # pass under 3.14). Skip the check; the server only imports anyio.
             #
-            # Two gotchas:
-            #  - `.override { doCheck = false }` is a silent no-op here: the
-            #    nixpkgs anyio package function is { stdenv, lib,
-            #    buildPythonPackage, ... }: buildPythonPackage rec {...} —
-            #    `doCheck` isn't a named arg, so `makeOverridable` re-calls the
-            #    function and `doCheck` is dropped by `...`. The drv hash never
-            #    changes, so the check phase still runs and fails.
-            #    `overrideAttrs` patches the built derivation instead (the box's
-            #    own overlays/debugpy.nix uses this form) and is what actually
-            #    skips the tests.
-            #  - Must override per-Python package sets: `serve` pins python312,
-            #    so the anyio in its closure is python312Packages.anyio, not
-            #    the top-level (python3) anyio. The top-level one is overridden
-            #    too so the change propagates wherever default-python anyio is
-            #    used.
-            anyio = prev.anyio.overrideAttrs (oldAttrs: { doCheck = false; });
-            python312Packages.anyio = prev.python312Packages.anyio.overrideAttrs (oldAttrs: { doCheck = false; });
+            # `overridePythonAttrs` is the ONLY mechanism that works here:
+            #  - `.override { doCheck = false }` silently drops `doCheck`
+            #    (it's not a named arg of the package function).
+            #  - `.overrideAttrs (oldAttrs: { doCheck = false; })` returns a
+            #    `__functor` (the `makeOverridablePythonPackage` wrapper,
+            #    python-packages-base.nix:80) and produces an identical drv
+            #    in an overlay context — verified by A/B (same drvPath).
+            #    The box's own overlays/debugpy.nix uses this form too and
+            #    is likewise a no-op; it's just not visible because
+            #    debugpy's tests happen to pass.
+            #  - `overridePythonAttrs { doCheck = false; doInstallCheck = false; }`
+            #    (python-packages-base.nix:79) re-wraps `buildPythonPackage`
+            #    directly and DOES produce a new drv. Verified the resulting
+            #    builder env drops check deps (pytest/hypothesis/trustme/etc)
+            #    and sets doCheck/doInstallCheck to ''.
+            #
+            # Must override per-Python package sets: `serve` pins python312,
+            # so the anyio entering its closure is python312Packages.anyio,
+            # not the top-level (python3) anyio.
+            python312Packages.anyio = prev.python312Packages.anyio.overridePythonAttrs {
+              doCheck = false;
+              doInstallCheck = false;
+            };
           })
         ];
       };
