@@ -73,8 +73,10 @@
                   final.python312Packages.typing-extensions
                 ];
 
-              meta = (prev.python312Packages.anyio.overridePythonAttrs { }.meta or { }) // {
+              meta = {
                 description = "Another async I/O library for Python";
+                homepage = "https://github.com/agronholm/anyio";
+                license = final.lib.licenses.mit;
               };
             };
           })
