@@ -41,3 +41,6 @@ set_source_files_properties(src/gemm.cu PROPERTIES COMPILE_OPTIONS "-DCUTLASS_EN
 add_executable(q27-sfcheck tools/sfcheck.cu)
 target_link_libraries(q27-sfcheck PRIVATE CUDA::cudart)
 target_include_directories(q27-sfcheck PRIVATE src ${CUTLASS_DIR}/include)
+
+install(TARGETS q27 DESTINATION lib)
+install(TARGETS q27-sfcheck DESTINATION bin)
