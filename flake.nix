@@ -16,72 +16,39 @@
         };
         overlays = [
           (final: prev: {
-            # anyio (transitive dep of transformers/httpx, needed by `serve`)
-            # installs fine; only its own test phase fails on the build pool
-            # under Python 3.12 (test_tls_connectable + a few asyncio threading
-            # tests) — environment-dependent stdlib behavior, not a package
-            # defect. The server only imports anyio; skip the check.
+            # anyio (transitive dep of transformers->huggingface-hub->httpx, needed
+            # by `serve`) installs fine; only its own test phase fails on the
+            # build pool under Python 3.12 (test_tls_connectable + a few asyncio
+            # threading tests) — environment-dependent stdlib behavior, not a
+            # package defect. The server only imports anyio; skip the check.
             #
-            # Why every "skip the check" trick fails here, all A/B-verified
-            # on this nixpkgs rev:
-            #  - `anyio.override { doCheck = false }` — `doCheck` isn't a named
-            #    arg of the package function, so makeOverridable drops it.
-            #  - `anyio.overrideAttrs (o: o // { doCheck = false; })` — returns
-            #    a __functor (makeOverridablePythonPackage, python-packages-
-            #    base.nix:80) that evaluates to the SAME drvPath in an overlay
-            #    context; the box's own overlays/debugpy.nix uses this form and
-            #    is likewise a no-op (invisible only because debugpy's tests
-            #    happen to pass).
-            #  - `anyio.overridePythonAttrs { doCheck = false; ... }` — changes
-            #    the isolated `anyio.drvPath`, but the result does NOT propagate
-            #    into a downstream `python312.withPackages` closure: an overlay
-            #    that sets `python312Packages.anyio` to this functor leaves
-            #    `serve.drvPath` byte-identical to the un-overlaid base, and
-            #    the served closure still references the un-patched anyio drv.
+            # The override must go through the interpreter's `packageOverrides`,
+            # not a top-level `python312Packages.anyio` — all A/B-verified on
+            # this nixpkgs rev:
+            #  - `serve` is `python312.withPackages (ps: with ps; [...])`, which
+            #    resolves modules from the *interpreter's* passthru set
+            #    `python312.pkgs` (with-packages.nix: `buildEnv.override {
+            #    extraLibs = f pythonPackages }` where pythonPackages IS the
+            #    interpreter's pkgs, built inside passthrufun.nix).
+            #  - A top-level overlay that sets `python312Packages.anyio` (plain
+            #    derivation or overridePythonAttrs) never touches `python312.pkgs`,
+            #    so `serve.drvPath` stays byte-identical — verified repeatedly:
+            #    the served closure still referenced the check-running anyio drv.
+            #  - `python312.overrideAttrs (oa: oa // { pkgs = ... })` fails
+            #    outright: `pkgs` is a passthru, not a derivation attr.
             #
-            # Replacing `python312Packages.anyio` with a *plain* derivation
-            # DOES propagate (sentinel test confirmed `serve.drvPath` changes),
-            # so rebuild anyio directly from its upstream recipe — same src /
-            # hash / runtime deps, minus the test suite and its deps
-            # (hypothesis, trustme, pytest-*, uvloop, psutil) that only the
-            # check phase needed. Also cheaper: no check deps to fetch/build.
-            #
-            # Must use `prev` (pre-overlay), not `final`: `final.python312Packages`
-            # IS the set this overlay is modifying, so referencing it from inside
-            # forces evaluation of that very set (a fixed-point loop) and fails
-            # with "attribute missing". `prev.python312Packages` is the complete
-            # base set, so the builder and the deps resolve cleanly.
-            # (pythonOlder is a python312Packages attr, not a top-level attr, so
-            # it's unavailable here either — hence the hardcoded 3.12 deps below.)
-            python312Packages.anyio = prev.python312Packages.buildPythonPackage rec {
-              pname = "anyio";
-              version = "4.14.2";
-              pyproject = true;
-              doCheck = false;
-
-              src = prev.fetchFromGitHub {
-                owner = "agronholm";
-                repo = "anyio";
-                tag = version;
-                # identical to upstream nixpkgs anyio 4.14.2 fetch hash
-                hash = "sha256-MEU0c8/NI1vlyNtBsg/hGLv6DR619ZqoZzNY1eJLEWM=";
-              };
-
-              # build-system
-              build-system = [ prev.python312Packages.setuptools-scm ];
-
-              # runtime deps: idna always; typing-extensions on < 3.13
-              # (this is python312, so both are required — matches the upstream
-              #  recipe's optionals at Python 3.12)
-              dependencies = [
-                prev.python312Packages.idna
-                prev.python312Packages.typing-extensions
-              ];
-
-              meta = {
-                description = "Another async I/O library for Python";
-                homepage = "https://github.com/agronholm/anyio";
-                license = prev.lib.licenses.mit;
+            # `python312.override { packageOverrides = ... }` is the actual hook
+            # into that internal set (cpython/default.nix:95; passthrufun.nix
+            # composes it into the set via makeScopeWithSplicing'). Verified: the
+            # patched anyio lands in serve's closure, `serve.drvPath` changes,
+            # and the resulting anyio has zero check-phase deps (hypothesis /
+            # trustme / pytest-* / uvloop / psutil all drop out), so the build
+            # pool never compiles the failing test suite.
+            python312 = prev.python312.override {
+              packageOverrides = self: super: {
+                anyio = super.anyio.overridePythonAttrs {
+                  doCheck = false;
+                };
               };
             };
           })
