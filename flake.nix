@@ -19,13 +19,16 @@
       cuda = pkgs.cudaPackages_13_3;  # matches the dev image (nvidia/cuda:13.3.0-devel)
 
       # CUTLASS v4.8 (sm_120a block-scaled FP4), pinned to the exact commit the engine was developed
-      # against (Dockerfile arg CUTLASS_COMMIT). The nixpkgs cudaPackages.cutlass (4.7.1) predates
-      # the block-scaled MMA features the engine uses, so we fetch the source directly.
-      cutlass = pkgs.fetchFromGitHub {
-        owner = "NVIDIA";
-        repo = "cutlass";
+      # against (dev/Dockerfile arg CUTLASS_COMMIT). nixpkgs cudaPackages.cutlass (4.7.1) predates the
+      # block-scaled MMA features the engine uses, so we fetch the source directly.
+      # fetchgit (not fetchFromGitHub): GitHub's on-demand commit tarballs are byte-non-deterministic,
+      # so any pinned tarball hash eventually rots. fetchgit hashes the checked-out tree deterministically
+      # and matches how the dev Docker image provisions CUTLASS (git clone + checkout, no submodules).
+      cutlass = pkgs.fetchgit {
+        url = "https://github.com/NVIDIA/cutlass";
         rev = "098de2a652cf8f00fd70b2df54051c7eccbb855a";
-        hash = "sha256-DQRCU3Njc62dQrAngb3kgvx7YzNE2zQnJy+qyDHcHnY=";
+        hash = "sha256-FiXSg6DMUAV9Gf5LOePKAwmGLVPxphq6MVwHZwwsKDM=";
+        fetchSubmodules = false;
       };
 
       # --- engine: C++/CUDA shared library (libq27.so) + q27-sfcheck diagnostic tool ---
