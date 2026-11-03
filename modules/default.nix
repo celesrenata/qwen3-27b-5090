@@ -285,7 +285,11 @@ in
         User = cfg.user;
         # The engine only runs on an RTX 5090 (SM120); fail prestart with a
         # clear message on any other card or without the NVIDIA driver.
-        ExecStartPre = ''
+        # ExecStartPre is passed as a *list* (one element per command) so the
+        # unit renders under both older nixpkgs (string) and newer nixpkgs,
+        # whose testing/service-runner concatenates the list. A single-element
+        # list keeps the multi-line prestart script intact.
+        ExecStartPre = [ ''
           command -v nvidia-smi >/dev/null 2>&1 || {
             echo "services.qwen27b: ERROR: nvidia-smi not found; enable hardware.nvidia" >&2
             exit 1
@@ -295,7 +299,7 @@ in
             *RTX*5090*) : ;;
             *) echo "services.qwen27b: ERROR: this engine requires an RTX 5090 (got: $GPU_MODEL)" >&2; exit 1 ;;
           esac
-        '';
+        '' ];
         ExecStart = execStart;
       };
     };
