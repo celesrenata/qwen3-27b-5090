@@ -52,18 +52,14 @@
 
         # The CMakeLists already sets CMAKE_CUDA_ARCHITECTURES=120a, CMAKE_BUILD_TYPE=Release,
         # CMAKE_CUDA_STANDARD=20. We only need to tell nixpkgs to use CMake+Ninja.
-        buildPhase = ''
-          runHook preBuild
-          cmake -B build -G Ninja
-          cmake --build build
-          runHook postBuild
-        '';
-
-        installPhase = ''
-          runHook preInstall
-          cmake --install build --prefix $out
-          runHook postInstall
-        '';
+        #
+        # Rely on the nixpkgs cmake hook (auto-registered because `cmake` is in
+        # nativeBuildInputs) to drive configure/build/install instead of hand-rolling
+        # buildPhase. A manual `cmake -B build` in buildPhase collided with the hook's
+        # auto-configure in configurePhase (which had already created `build/` and left
+        # the cwd inside it), so the second configure treated the build dir as the source
+        # dir: "The source directory /build/engine/build does not contain CMakeLists.txt".
+        cmakeConfigureArgs = [ "-G" "Ninja" ];
 
         meta = with pkgs.lib; {
           description = "Qwen3.8-27B inference engine (C++/CUDA, SM120)";
