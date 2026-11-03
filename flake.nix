@@ -16,14 +16,18 @@
         };
         overlays = [
           (final: prev: {
-            # anyio (transitive dep of transformers, needed by `serve`) installs
-            # fine; only its own test phase fails on the build pool under
-            # Python 3.12 — test_tls_connectable hits "server_hostname can only
-            # be specified in client mode" and a few asyncio threading tests fail
-            # with unraisable-exception warnings (environment-dependent stdlib
-            # behavior, not a package defect). Skip the check; the server only
-            # imports it.
+            # anyio (transitive dep of transformers/httpx, needed by `serve`)
+            # installs fine; only its own test phase fails on the build pool
+            # under Python 3.12 — test_tls_connectable hits "server_hostname
+            # can only be specified in client mode" and a few asyncio threading
+            # tests fail with unraisable-exception warnings (environment-
+            # dependent stdlib behavior, not a package defect; the same tests
+            # pass under 3.14). Skip the check; the server only imports anyio.
+            # Must override per-Python package sets: `serve` pins python312, so
+            # the anyio that enters its closure is python312Packages.anyio, not
+            # the top-level (python3) anyio.
             anyio = prev.anyio.override { doCheck = false; };
+            python312Packages.anyio = prev.python312Packages.anyio.override { doCheck = false; };
           })
         ];
       };
