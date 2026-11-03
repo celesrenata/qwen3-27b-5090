@@ -46,16 +46,20 @@
             # (hypothesis, trustme, pytest-*, uvloop, psutil) that only the
             # check phase needed. Also cheaper: no check deps to fetch/build.
             #
-            # `final` (not `prev`) so the rebuilt anyio picks up any further
-            # overlays downstream; only anyio itself is replaced, so this
-            # cannot recurse.
-            python312Packages.anyio = final.python312Packages.buildPythonPackage rec {
+            # Must use `prev` (pre-overlay), not `final`: `final.python312Packages`
+            # IS the set this overlay is modifying, so referencing it from inside
+            # forces evaluation of that very set (a fixed-point loop) and fails
+            # with "attribute missing". `prev.python312Packages` is the complete
+            # base set, so the builder and the deps resolve cleanly.
+            # (pythonOlder is a python312Packages attr, not a top-level attr, so
+            # it's unavailable here either — hence the hardcoded 3.12 deps below.)
+            python312Packages.anyio = prev.python312Packages.buildPythonPackage rec {
               pname = "anyio";
               version = "4.14.2";
               pyproject = true;
               doCheck = false;
 
-              src = final.fetchFromGitHub {
+              src = prev.fetchFromGitHub {
                 owner = "agronholm";
                 repo = "anyio";
                 tag = version;
@@ -64,19 +68,20 @@
               };
 
               # build-system
-              build-system = [ final.python312Packages.setuptools-scm ];
+              build-system = [ prev.python312Packages.setuptools-scm ];
 
-              # runtime deps: idna + typing-extensions on < 3.13
-              dependencies =
-                [ final.python312Packages.idna ]
-                ++ lib.optionals (final.pythonOlder "3.13") [
-                  final.python312Packages.typing-extensions
-                ];
+              # runtime deps: idna always; typing-extensions on < 3.13
+              # (this is python312, so both are required — matches the upstream
+              #  recipe's optionals at Python 3.12)
+              dependencies = [
+                prev.python312Packages.idna
+                prev.python312Packages.typing-extensions
+              ];
 
               meta = {
                 description = "Another async I/O library for Python";
                 homepage = "https://github.com/agronholm/anyio";
-                license = final.lib.licenses.mit;
+                license = prev.lib.licenses.mit;
               };
             };
           })
