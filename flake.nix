@@ -18,34 +18,64 @@
           (final: prev: {
             # anyio (transitive dep of transformers/httpx, needed by `serve`)
             # installs fine; only its own test phase fails on the build pool
-            # under Python 3.12 — test_tls_connectable hits "server_hostname
-            # can only be specified in client mode" and a few asyncio threading
-            # tests fail with unraisable-exception warnings (environment-
-            # dependent stdlib behavior, not a package defect; the same tests
-            # pass under 3.14). Skip the check; the server only imports anyio.
+            # under Python 3.12 (test_tls_connectable + a few asyncio threading
+            # tests) — environment-dependent stdlib behavior, not a package
+            # defect. The server only imports anyio; skip the check.
             #
-            # `overridePythonAttrs` is the ONLY mechanism that works here:
-            #  - `.override { doCheck = false }` silently drops `doCheck`
-            #    (it's not a named arg of the package function).
-            #  - `.overrideAttrs (oldAttrs: { doCheck = false; })` returns a
-            #    `__functor` (the `makeOverridablePythonPackage` wrapper,
-            #    python-packages-base.nix:80) and produces an identical drv
-            #    in an overlay context — verified by A/B (same drvPath).
-            #    The box's own overlays/debugpy.nix uses this form too and
-            #    is likewise a no-op; it's just not visible because
-            #    debugpy's tests happen to pass.
-            #  - `overridePythonAttrs { doCheck = false; doInstallCheck = false; }`
-            #    (python-packages-base.nix:79) re-wraps `buildPythonPackage`
-            #    directly and DOES produce a new drv. Verified the resulting
-            #    builder env drops check deps (pytest/hypothesis/trustme/etc)
-            #    and sets doCheck/doInstallCheck to ''.
+            # Why every "skip the check" trick fails here, all A/B-verified
+            # on this nixpkgs rev:
+            #  - `anyio.override { doCheck = false }` — `doCheck` isn't a named
+            #    arg of the package function, so makeOverridable drops it.
+            #  - `anyio.overrideAttrs (o: o // { doCheck = false; })` — returns
+            #    a __functor (makeOverridablePythonPackage, python-packages-
+            #    base.nix:80) that evaluates to the SAME drvPath in an overlay
+            #    context; the box's own overlays/debugpy.nix uses this form and
+            #    is likewise a no-op (invisible only because debugpy's tests
+            #    happen to pass).
+            #  - `anyio.overridePythonAttrs { doCheck = false; ... }` — changes
+            #    the isolated `anyio.drvPath`, but the result does NOT propagate
+            #    into a downstream `python312.withPackages` closure: an overlay
+            #    that sets `python312Packages.anyio` to this functor leaves
+            #    `serve.drvPath` byte-identical to the un-overlaid base, and
+            #    the served closure still references the un-patched anyio drv.
             #
-            # Must override per-Python package sets: `serve` pins python312,
-            # so the anyio entering its closure is python312Packages.anyio,
-            # not the top-level (python3) anyio.
-            python312Packages.anyio = prev.python312Packages.anyio.overridePythonAttrs {
+            # Replacing `python312Packages.anyio` with a *plain* derivation
+            # DOES propagate (sentinel test confirmed `serve.drvPath` changes),
+            # so rebuild anyio directly from its upstream recipe — same src /
+            # hash / runtime deps, minus the test suite and its deps
+            # (hypothesis, trustme, pytest-*, uvloop, psutil) that only the
+            # check phase needed. Also cheaper: no check deps to fetch/build.
+            #
+            # `final` (not `prev`) so the rebuilt anyio picks up any further
+            # overlays downstream; only anyio itself is replaced, so this
+            # cannot recurse.
+            python312Packages.anyio = final.python312Packages.buildPythonPackage rec {
+              pname = "anyio";
+              version = "4.14.2";
+              pyproject = true;
               doCheck = false;
-              doInstallCheck = false;
+
+              src = final.fetchFromGitHub {
+                owner = "agronholm";
+                repo = "anyio";
+                tag = version;
+                # identical to upstream nixpkgs anyio 4.14.2 fetch hash
+                hash = "sha256-MEU0c8/NI1vlyNtBsg/hGLv6DR619ZqoZzNY1eJLEWM=";
+              };
+
+              # build-system
+              build-system = [ final.python312Packages.setuptools-scm ];
+
+              # runtime deps: idna + typing-extensions on < 3.13
+              dependencies =
+                [ final.python312Packages.idna ]
+                ++ lib.optionals (final.pythonOlder "3.13") [
+                  final.python312Packages.typing-extensions
+                ];
+
+              meta = (prev.python312Packages.anyio.overridePythonAttrs { }.meta or { }) // {
+                description = "Another async I/O library for Python";
+              };
             };
           })
         ];
