@@ -161,6 +161,9 @@
         nativeBuildInputs = [ pyEnv ];
         doCheck = true;
         checkPhase = "cd frontend && python -m pytest -q tests/";
+        # nixpkgs >= 25.x requires the builder to create $out; a pure-test
+        # derivation must still produce (empty) output.
+        installPhase = "mkdir -p $out";
       };
 
       # CPU-runnable reference tests (GDN math, quantization). The snapshot
@@ -182,6 +185,9 @@
         nativeBuildInputs = [ pyEnv ];
         doCheck = true;
         checkPhase = "cd reference && PYTHONPATH=. python -m pytest -q tests/test_gdn.py tests/test_quant.py";
+        # nixpkgs >= 25.x requires the builder to create $out; a pure-test
+        # derivation must still produce (empty) output.
+        installPhase = "mkdir -p $out";
       };
 
     in {
