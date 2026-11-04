@@ -51,11 +51,15 @@ in
     # from the HF cache; HF_HUB_OFFLINE + TRANSFORMERS_OFFLINE are set below).
     modelPath = mkOption {
       type = types.str;
-      default = "./hf";
+      # Default to the service user's home (a systemd StateDirectory that is
+      # created and owned by the user — unlike the upstream docker-compose
+      # default `./hf`, which under systemd resolves to `/hf`, owned by root).
+      # Override to reuse an existing weights dir, e.g. `/var/lib/vllm` for a
+      # pre-existing vLLM HF cache.
+      default = "/var/lib/qwen27b/hf";
       description = ''
-        HF home for the weights. Defaults to the relative path the upstream
-        `docker compose` uses; set it to an absolute store path on a NixOS
-        install.
+        HF home for the weights (`HF_HOME`). `HF_HUB_OFFLINE` +
+        `TRANSFORMERS_OFFLINE` are set, so this must already contain the model.
       '';
     };
 
@@ -153,6 +157,27 @@ in
       description = "System user the service runs as.";
     };
 
+    createUser = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Whether the module creates `user` (system user + group) itself. Set to
+        false to run the service as an existing user you manage elsewhere (e.g.
+        a shared inference user) — the module then only declares the service
+        and its `StateDirectory`, and leaves the user/group to you.
+      '';
+    };
+
+    userHome = mkOption {
+      type = types.str;
+      default = "/var/lib/qwen27b";
+      description = ''
+        Home directory of the service user (doubles as `$HOME`). Created by
+        systemd's `StateDirectory` and owned by the service user, so it exists
+        even though a system user has `createHome = false`.
+      '';
+    };
+
     gpuLockFile = mkOption {
       type = types.nullOr types.str;
       default = null;
@@ -229,6 +254,22 @@ in
 
   config = lib.mkIf cfg.enable {
 
+    # The service runs as its own system user so the weights/cache live in a
+    # private home, isolated from the rest of the system. NVIDIA device nodes
+    # are world-writable (mode 666) once the driver is enabled, so no extra
+    # group membership is required for /dev/nvidia*. When `createUser` is false
+    # the caller owns the user (e.g. a shared inference account) and the module
+    # must not touch `users.*`.
+    users = lib.mkIf cfg.createUser {
+      users.${cfg.user} = {
+        isSystemUser = true;
+        group = cfg.user;
+        home = cfg.userHome;
+        useDefaultShell = true;
+      };
+      groups.${cfg.user} = { };
+    };
+
     systemd.services.qwen27b =
       let
         # Default server invocation; the wrapper can replace via `execStart`.
@@ -253,6 +294,10 @@ in
         KV_DTYPE = cfg.kvDtype;
         SPEC = cfg.spec;
         VISION = cfg.vision;
+        # The service user has createHome=false, so systemd does not set
+        # $HOME; the HF cache under HF_HOME and any `~`-relative paths in the
+        # server need a real, user-owned home.
+        HOME = cfg.userHome;
         STATE_HOST_CACHE = toString cfg.stateHostCacheGiB;
         CHECKPOINT_INTERVAL = toString cfg.checkpointInterval;
         MAX_TOKENS = toString cfg.maxTokens;
@@ -286,6 +331,15 @@ in
 
       serviceConfig = cfg.serviceConfig // {
         User = cfg.user;
+        # Create + own the service user's home (users.users.<n>.createHome
+        # defaults to false for system users, so systemd must do it). Derive it
+        # from userHome rather than user so overriding one option never leaves
+        # $HOME and the created directory out of sync. `StateDirectory` is
+        # relative to /var/lib, so the default /var/lib/qwen27b becomes
+        # `qwen27b` (a home outside /var/lib passes through unchanged, which
+        # systemd accepts from v235). systemd creates it at 0700 owned by the
+        # service user.
+        StateDirectory = lib.removePrefix "/var/lib/" cfg.userHome;
         # The engine only runs on an RTX 5090 (SM120); fail prestart with a
         # clear message on any other card or without the NVIDIA driver.
         # ExecStartPre is a list of executable paths. Use a generated shell

@@ -200,6 +200,49 @@ restarts it with other settings (weights, KV cache type, speculative decoding, v
 context limit, VRAM budget), showing for every choice the context it leaves before anything is loaded
 ([docs/configuration.md](docs/configuration.md#start-settings)).
 
+### NixOS (flake)
+
+The engine also runs on NixOS from this repository's flake, without Docker: the
+`engine`, `serve` and `repoFiles` packages plus a `services.qwen27b` systemd
+module (the same defaults as the Configuration table above).
+
+```nix
+# flake.nix of your system
+{
+  inputs.qwen27b.url = "github:mkyt/qwen3-27b-5090/pr/nixos-flake";
+
+  outputs = { self, nixpkgs, qwen27b }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        ./configuration.nix
+        qwen27b.nixosModules.qwen27b
+      ];
+    };
+  };
+}
+```
+
+```nix
+# configuration.nix
+services.qwen27b = {
+  enable = true;
+  engine = qwen27b.packages."x86_64-linux".engine;
+  serve = qwen27b.packages."x86_64-linux".serve;
+  files = qwen27b.packages."x86_64-linux".repoFiles;
+};
+```
+
+The service listens on `http://127.0.0.1:8000` (the same API as the Docker
+setup) and runs as its own system user `qwen27b`, whose home
+(`/var/lib/qwen27b`, created by systemd's `StateDirectory`) holds the weights:
+`HF_HOME` defaults to `/var/lib/qwen27b/hf`, so download the 23 GB checkpoint
+there first (`HF_HUB_OFFLINE` is set and the server never downloads). To run
+under a user you already manage (e.g. an existing inference account) set
+`user = "…"` and `createUser = false`; `userHome` and `modelPath` then point
+at that account's directories. A prestart check fails with a clear message
+unless the card is an RTX 5090 (the kernels are SM120-only), and a GPU lock
+keeps concurrent engines from sharing it.
+
 ## Clients
 
 - **OpenAI-compatible** (chat completions, completions, Responses): base URL `http://127.0.0.1:8000/v1`, any API key,
