@@ -6,6 +6,8 @@
 #include <fstream>
 
 #include "common.h"
+#include "fs.h"
+#include "prefetch.h"
 
 namespace q27 {
 
@@ -103,8 +105,8 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, int max_ctx_rows,
   tensor("candidate_selector.predecessor_codebook", &pred_cb_, -1, kSelRank);
   tensor("candidate_selector.successor_codebook", &succ_cb_, -1, kSelRank);
 
-  if (const char* vf = getenv("Q27_DRAFT_VOCAB"); vf && *vf) {
-    std::ifstream in(vf);
+  if (const std::string vf = env_path("Q27_DRAFT_VOCAB"); !vf.empty()) {
+    std::ifstream in(fs_path(vf));
     Q27_CHECK(in.good(), std::string("cannot read the draft vocabulary ") + vf);
     for (int64_t id; in >> id;) {
       Q27_CHECK(id >= 0 && id < dims::kVocab, "draft vocabulary: id out of range");
@@ -117,7 +119,7 @@ Draft::Draft(const std::string& dir, Pool& weights, Pool& act, int max_ctx_rows,
     vocab_ids_off_ = wpool_.add("draft vocabulary ids", size_t(n) * 4);
     vocab_w_off_ = wpool_.add("draft vocabulary head", size_t(n) * kHidden / 2);
     vocab_sf_off_ = wpool_.add("draft vocabulary head scales", size_t(sf_bytes(n, kHidden / 16)));
-    log("draft vocabulary: %d ids (%s)", n, vf);
+    log("draft vocabulary: %d ids (%s)", n, vf.c_str());
   }
 
   const int R = max_ctx_rows_;
@@ -194,27 +196,25 @@ void Draft::bind() {
 
 void Draft::load(cudaStream_t s) {
   auto t0 = std::chrono::steady_clock::now();
-  constexpr size_t kStage = 128 << 20;
-  void* stage[2];
-  cudaEvent_t done[2];
-  for (int i = 0; i < 2; i++) {
-    Q27_CUDA(cudaHostAlloc(&stage[i], kStage, cudaHostAllocDefault));
-    Q27_CUDA(cudaEventCreateWithFlags(&done[i], cudaEventDisableTiming));
-    Q27_CUDA(cudaEventRecord(done[i], s));
-  }
-  int cur = 0;
-  size_t total = 0;
-  // Streams one tensor into device memory at dst through the pinned staging buffers.
+  constexpr int64_t kChunk = Prefetcher::kSlotBytes;
+  // Every tensor in slot-sized chunks, read ahead by several threads (prefetch.h), in the order uploaded below.
+  std::vector<Prefetcher::Read> plan;
+  auto plan_tensor = [&](const std::string& name) {
+    const int64_t n = ckpt_->info(name).nbytes;
+    for (int64_t off = 0; off < n; off += kChunk) plan.push_back({ckpt_.get(), name, off, std::min(kChunk, n - off), nullptr});
+  };
+  for (auto& j : plain_) plan_tensor(j.name);
+  for (auto& j : lin_) plan_tensor(j.name);
+  Prefetcher pf(std::move(plan));
+  size_t ri = 0, total = 0;
+  // Streams one tensor into device memory at dst through the prefetcher's pinned slots.
   auto upload = [&](const std::string& name, char* dst) {
     const auto& info = ckpt_->info(name);
     total += size_t(info.nbytes);
-    for (int64_t off = 0; off < info.nbytes; off += kStage) {
-      const int64_t len = std::min<int64_t>(kStage, info.nbytes - off);
-      Q27_CUDA(cudaEventSynchronize(done[cur]));
-      ckpt_->read_range(name, off, len, stage[cur]);
-      Q27_CUDA(cudaMemcpyAsync(dst + off, stage[cur], size_t(len), cudaMemcpyHostToDevice, s));
-      Q27_CUDA(cudaEventRecord(done[cur], s));
-      cur ^= 1;
+    for (int64_t off = 0; off < info.nbytes; off += kChunk) {
+      void* buf = pf.get(ri, name, off);
+      Q27_CUDA(cudaMemcpyAsync(dst + off, buf, size_t(std::min(kChunk, info.nbytes - off)), cudaMemcpyHostToDevice, s));
+      pf.release(ri++, s);
     }
   };
   for (auto& j : plain_) upload(j.name, wpool_.at<char>(j.offset));
@@ -236,10 +236,6 @@ void Draft::load(cudaStream_t s) {
   }
   Q27_CUDA(cudaStreamSynchronize(s));
   if (tmp) Q27_CUDA(cudaFree(tmp));
-  for (int i = 0; i < 2; i++) {
-    cudaEventDestroy(done[i]);
-    cudaFreeHost(stage[i]);
-  }
   double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   log("loaded the draft (%.2f GB) in %.1f s", total / 1e9, sec);
 }
@@ -416,7 +412,7 @@ void Draft::append_ctx(const bf16* cap, int rows, const int32_t* pos, int pos_ad
     return;
   }
   Q27_CHECK(!rowmap, "draft append_ctx: rowmap needs <= 8 rows");
-  // Prompt: BF16 GEMMs through CUTLASS, quantized weights dequantized slice by slice into scratch.
+  // Prompt: BF16 GEMMs (gemm_bf16), quantized weights dequantized slice by slice into scratch.
   auto big = [&](const DLinear& l, int r0, int n, const bf16* a, float* d, int ldd) {
     if (!l.scale) {
       Q27_CHECK(ldd == n, "draft: strided output");

@@ -33,6 +33,13 @@ int guard(F&& f) {
 
 float g_last_us = 0.f;
 
+VisionPixels rgb_pixels(const uint8_t* rgb, const float* norm) {
+  VisionPixels px;
+  px.rgb = rgb;
+  for (int c = 0; c < 3; c++) px.mean[c] = norm[c], px.std[c] = norm[3 + c];
+  return px;
+}
+
 // The kernel wrappers launch on this stream (a real stream: PDL applies and launches can be captured).
 cudaStream_t ts() {
   static cudaStream_t s = [] {
@@ -103,6 +110,38 @@ struct DevInt {
   }
 };
 
+// The engine's options: the arguments of q27_create and the environment (docs/configuration.md).
+Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir) {
+  Options o;
+  o.model_dir = model_dir;
+  if (draft_dir && *draft_dir) o.draft_dir = draft_dir;
+  if (max_tokens > 0) o.max_tokens = max_tokens;
+  if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
+  o.logits_rows = std::min(o.logits_rows, o.prefill_chunk);
+  Q27_CHECK(kv_fp8 >= 0 && kv_fp8 <= 2, "kv type: 0 BF16, 1 FP8, 2 NVFP4");
+  o.kv_type = KvType(kv_fp8);  // (kv_fp8: the KV type code; 1 / true stays FP8)
+  // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
+  // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
+  if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
+  if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
+  if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
+  // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
+  // per request).
+  if (const char* e = getenv("VISION"); e && *e) {
+    const std::string v = e;
+    Q27_CHECK(v == "off" || v == "bf16" || v == "host" || v == "fp8", "VISION: off, bf16, host or fp8");
+    o.vision = v == "bf16" ? 1 : v == "host" ? 2 : v == "fp8" ? 3 : 0;
+  }
+  if (const char* e = getenv("IMAGE_MAX_PIXELS")) o.image_max_pixels = atoi(e);
+  if (const char* e = getenv("IMAGE_TOKENS")) o.image_tokens = atoi(e);
+  // Several sequences (Phase 6): MAX_SEQS - 1 parking areas (unset / 1: one sequence at a time).
+  if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
+  // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
+  if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+  if (const char* e = getenv("MIN_KV_TOKENS"); e && *e) o.min_kv_tokens = atoi(e);
+  return o;
+}
+
 }  // namespace
 
 namespace q27 {
@@ -119,33 +158,19 @@ void q27t_gdn_probe(long long* out) { q27::gdn_probe_read(out); }
 
 void* q27_create(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir) {
   Model* m = nullptr;
+  guard([&] { m = new Model(engine_options(model_dir, max_tokens, prefill_chunk, kv_fp8, draft_dir)); });
+  return m;
+}
+
+// The memory plan of q27_create(...) on a device with `free` of `total` bytes free after the CUDA context, without
+// CUDA: nothing is allocated or loaded (the checkpoints' headers are read). Ask it with q27_memory_report,
+// q27_max_tokens, q27_cache_stats and q27_device_memory, then q27_destroy it (the stats page's start settings).
+void* q27_plan(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir, int64_t free,
+               int64_t total) {
+  Model* m = nullptr;
   guard([&] {
-    Options o;
-    o.model_dir = model_dir;
-    if (draft_dir && *draft_dir) o.draft_dir = draft_dir;
-    if (max_tokens > 0) o.max_tokens = max_tokens;
-    if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
-    o.logits_rows = std::min(o.logits_rows, o.prefill_chunk);
-    Q27_CHECK(kv_fp8 >= 0 && kv_fp8 <= 2, "kv type: 0 BF16, 1 FP8, 2 NVFP4");
-    o.kv_type = KvType(kv_fp8);  // (kv_fp8: the KV type code; 1 / true stays FP8)
-    // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
-    // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
-    if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
-    if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
-    if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
-    // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
-    // per request).
-    if (const char* e = getenv("VISION"); e && *e) {
-      const std::string v = e;
-      Q27_CHECK(v == "off" || v == "bf16" || v == "host" || v == "fp8", "VISION: off, bf16, host or fp8");
-      o.vision = v == "bf16" ? 1 : v == "host" ? 2 : v == "fp8" ? 3 : 0;
-    }
-    if (const char* e = getenv("IMAGE_MAX_PIXELS")) o.image_max_pixels = atoi(e);
-    if (const char* e = getenv("IMAGE_TOKENS")) o.image_tokens = atoi(e);
-    // Several sequences (Phase 6): MAX_SEQS - 1 parking areas (unset / 1: one sequence at a time).
-    if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
-    // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
-    if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+    Options o = engine_options(model_dir, max_tokens, prefill_chunk, kv_fp8, draft_dir);
+    o.plan_only = true, o.plan_free = size_t(free), o.plan_total = size_t(total);
     m = new Model(o);
   });
   return m;
@@ -249,20 +274,51 @@ int q27_checkpoint(void* m) {
   return guard([&] { static_cast<Model*>(m)->checkpoint(); });
 }
 
-// out[11]: lookups, hits, prompt tokens, cached tokens, saved, evicted, live checkpoints, free KV pages, pages
-// only checkpoints hold, pool pages, KV pages of a parking area.
+// out[12]: lookups, hits, prompt tokens, cached tokens, saved, evicted, live checkpoints, free KV pages, pages
+// only checkpoints hold, pool pages, KV pages of a parking area, state slots allocated.
 int q27_cache_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->cache_stats(out); });
 }
 
+// Allocates up to n more pinned state slots of the prefix cache (*added: how many; 0 once all are).
+int q27_cache_grow(void* m, int n, int* added) {
+  return guard([&] { *added = static_cast<Model*>(m)->grow_state_cache(n); });
+}
+
+// Memory (stats UI): the pool report (Model::memory_report) copied into buf[0..cap) with a terminating 0;
+// returns its length (call again with a larger buffer when it is >= cap), or -1 on an error.
+int q27_memory_report(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->memory_report(); }) != 0) return -1;
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+
+// out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.
+int q27_device_memory(void* m, int64_t* out) {
+  return guard([&] { static_cast<Model*>(m)->device_memory(out); });
+}
+
 // Images (P4-12): spans [n][3] = (start, gh, gw) of the request (after q27_reset / q27_prefix_begin), the
-// vision tower on image i (pixels [4 * gh * gw][1536] fp32), its embeddings [gh * gw][5120] BF16 (tests).
+// vision tower on image i (pixels [4 * gh * gw][1536] fp32, or the resized image [32 * gh][32 * gw][3] uint8
+// with norm = mean[3], std[3]: VisionPixels), its embeddings [gh * gw][5120] BF16 (tests).
 int q27_has_vision(void* m) { return static_cast<Model*>(m)->has_vision() ? 1 : 0; }
 int q27_mm_set(void* m, const int32_t* spans, int n) {
   return guard([&] { static_cast<Model*>(m)->mm_set(spans, n); });
 }
 int q27_mm_encode(void* m, int i, const float* pixels) {
-  return guard([&] { static_cast<Model*>(m)->mm_encode(i, pixels); });
+  return guard([&] {
+    VisionPixels px;
+    px.patches = pixels;
+    static_cast<Model*>(m)->mm_encode(i, px);
+  });
+}
+int q27_mm_encode_rgb(void* m, int i, const uint8_t* rgb, const float* norm) {
+  return guard([&] { static_cast<Model*>(m)->mm_encode(i, rgb_pixels(rgb, norm)); });
 }
 int q27_mm_embeds(void* m, int i, bf16* out) {
   return guard([&] { static_cast<Model*>(m)->mm_embeds(i, out); });
@@ -289,6 +345,20 @@ int q27_profile_dump(void* m) {
 
 // ---------------------------------------------------------------- kernels (tests)
 
+// The BF16 patches [gh * gw][1536] (out, device) of host pixels: fp32 patches, or with rgb the image and norm.
+int q27t_vision_pixels(const float* patches, const uint8_t* rgb, const float* norm, int gh, int gw, bf16* out) {
+  return kernel([&] {
+    VisionPixels px = rgb ? rgb_pixels(rgb, norm) : VisionPixels{};
+    px.patches = patches;
+    constexpr size_t kTmp = size_t(4) << 20;  // (small: several chunks or bands for the larger test images)
+    static void* tmp = [] {
+      void* x;
+      Q27_CUDA(cudaMalloc(&x, kTmp));
+      return x;
+    }();
+    vision_pixels(px, gh, gw, out, tmp, kTmp, ts());
+  });
+}
 int q27t_rmsnorm(const float* x, const bf16* w, int T, int D, float eps, int zc, float* out) {
   return kernel([&] { rmsnorm(x, w, T, D, eps, zc != 0, out, ts()); });
 }
@@ -328,9 +398,17 @@ int q27t_silu_mul_quant_fp4_bf16(const bf16* g, const bf16* u, int64_t ld, int T
                                  uint8_t* sf) {
   return kernel([&] { silu_mul_quant_fp4(g, u, ld, T, I, in_scale, q, sf, ts()); });
 }
+int q27t_silu_mul_quant_fp4_glu(const float* gu, int T, int I, float ag, float au, float in_scale, uint8_t* q,
+                                uint8_t* sf) {
+  return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
+}
+int q27t_silu_mul_quant_fp4_glu_bf16(const bf16* gu, int T, int I, float ag, float au, float in_scale, uint8_t* q,
+                                     uint8_t* sf) {
+  return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
+}
 int q27t_gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                       float alpha, bf16* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ws, ws_bytes, ts()); });
+                       float alpha, bf16* d) {
+  return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ts()); });
 }
 int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* oa, float* ob) {
   return kernel([&] { linear_bf16_pair(x, wa, wb, T, N, K, oa, ob, ts()); });
@@ -338,18 +416,42 @@ int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T,
 int q27t_swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst) {
   return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts()); });
 }
+int q27t_swizzle_sf_glu(const uint8_t* src, int rows, int kblocks, uint8_t* dst, int half) {
+  return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts(), half); });
+}
 int64_t q27t_sf_bytes(int64_t rows, int64_t kblocks) { return sf_bytes(rows, kblocks); }
 int q27t_gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                  float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ws, ws_bytes, ts()); });
+                  float alpha, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ts()); });
+}
+int q27t_gemm_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                      const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                      uint8_t* q_sf) {
+  return kernel([&] { gemm_fp4_glu(M, I, K, a, a_sf, gate_up, gate_up_sf, alpha_gate, alpha_up, out_scale, q, q_sf, ts()); });
 }
 int q27t_gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-                  float* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ws, ws_bytes, ts()); });
+                  float* d) {
+  return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ts()); });
 }
-size_t q27t_gemm_workspace_bytes() { return gemm_workspace_bytes(0); }
-int q27t_gemm_workspace_init(void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_workspace_init(ws, ws_bytes, ts()); });
+int q27t_gemm_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* b,
+                         const float* wscale, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp8_scaled(M, N, K, a, ascale, b, wscale, c, beta, d, ts()); });
+}
+int q27t_skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w,
+                           const float* wscale, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
+  return kernel([&] { skinny_fp8_scaled(M, N, K, a, ascale, w, wscale, c, beta, d, ws, ws_bytes, ts()); });
+}
+int q27t_quant_fp8_rows(const float* x, int64_t ld, int T, int K, uint8_t* q, float* scale) {
+  return kernel([&] { quant_fp8_rows(x, ld, T, K, q, scale, ts()); });
+}
+int q27t_silu_mul_quant_fp8_rows(const float* g, const float* u, int64_t ld, int T, int I, uint8_t* q, float* scale) {
+  return kernel([&] { silu_mul_quant_fp8_rows(g, u, ld, T, I, q, scale, ts()); });
+}
+int q27t_rmsnorm_quant_rows(const float* x, const bf16* w, int T, float eps, float* out, uint8_t* q, float* scale) {
+  return kernel([&] { rmsnorm_quant(x, w, T, eps, out, {QuantOut::kFp8Row, 1.f, q, nullptr, scale}, ts()); });
+}
+int q27t_dequant_fp8_rows(const uint8_t* w, const float* scale, int rows, int K, bf16* out) {
+  return kernel([&] { dequant_fp8_rows(w, scale, rows, K, out, ts()); });
 }
 int q27t_skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                     float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
@@ -360,9 +462,9 @@ int q27t_skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, flo
   return kernel([&] { skinny_fp8(M, N, K, a, w, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });
 }
 // Microbenchmark: average time (us) of `iters` calls, cycling through `nbuf` weight copies spaced
-// w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8;
-// cutlass != 0: the Phase 1 CUTLASS kernel instead.
-int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
+// w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8; many != 0: the many-row
+// GEMM (gemm_fp4 / gemm_fp8) instead.
+int q27t_bench_gemm(int fp4, int many, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
                     const uint8_t* w, const uint8_t* w_sf, int64_t w_stride, int64_t sf_stride, int nbuf, int iters,
                     float* d, void* ws, size_t ws_bytes, float* us) {
   return kernel([&] {
@@ -372,9 +474,9 @@ int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a,
     auto run = [&](int i) {
       const uint8_t* wi = w + (i % nbuf) * w_stride;
       const uint8_t* si = w_sf ? w_sf + (i % nbuf) * sf_stride : nullptr;
-      if (fp4 && cutlass) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
+      if (fp4 && many) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ts());
+      else if (many) gemm_fp8(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ts());
       else if (fp4) skinny_fp4(M, N, K, a, a_sf, wi, si, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
-      else if (cutlass) gemm_fp8(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
       else skinny_fp8(M, N, K, a, wi, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
     };
     for (int i = 0; i < std::max(nbuf, iters); i++) run(i);  // warm-up (clocks, L2 state)
@@ -443,6 +545,11 @@ int q27t_skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d
 }
 int q27t_gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d) {
   return kernel([&] { gemm_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ts()); });
+}
+// The general form (C, beta).
+int q27t_gemm_bf16_ex(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta,
+                      float* d) {
+  return kernel([&] { gemm_bf16(M, N, K, a, w, alpha, c, beta, d, ts()); });
 }
 // GDN verify of T tokens on one layer: ptrs of the two input buffers (raw, k, v, ab each), the parity and the
 // commit count of the previous verify (device ints).

@@ -27,8 +27,8 @@ in
     engine = mkOption {
       type = types.package;
       description = ''
-        Derivation installing libq27.so under $out/lib and the q27-sfcheck
-        tool under $out/bin (e.g. `qwen27b.packages."x86_64-linux".engine`).
+        Derivation installing libq27.so under $out/lib
+        (e.g. `qwen27b.packages."x86_64-linux".engine`).
       '';
     };
     serve = mkOption {

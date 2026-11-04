@@ -49,8 +49,8 @@ attention layers (every fourth layer). Hidden size 5120, MLP 17408, vocabulary 2
 loops at 2,014 TFLOPS (NVFP4), 1,007 TFLOPS (FP8 as block-scaled `mxf8f6f4`; the plain FP8 MMA with FP32
 accumulation runs at half that rate) and 253 TFLOPS (BF16) (`micro/`). SM120 has the warp-level `mma.sync`
 instructions with block scales, but not the `tcgen05` / TMEM / `wgmma` of data-center Blackwell and Hopper, so
-kernels written for those GPUs do not run; the engine uses CUTLASS's SM120 GEMMs for prefill and its own kernels
-for the rest.
+kernels written for those GPUs do not run; the engine's kernels, prefill GEMMs included, are its own (no CUTLASS
+since P5-12).
 
 At 400 W, compute-bound work runs at the power limit: an FP4 GEMM holds the SM clock at about 1.8 GHz. Prefill
 speed is therefore set by energy per FLOP, which favors the FP4 and FP8 tensor cores over BF16. Decode is
@@ -85,6 +85,13 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 - **No PyTorch in the engine.** The CUDA context and libraries stay small, nothing allocates while serving, and the
   memory plan does not depend on a profiling run. (In the vLLM setup this replaced, the KV cache size varied
   between 4.3 and 6.5 GiB from one start to the next.) PyTorch is used only by the reference model and the tests.
+  The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
+  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, and images are
+  resized with PIL and normalized on the GPU (`frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` compares
+  prompts, ids and image grids with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
+  download): a distroless base (glibc and libstdc++), the CUDA runtime library, `libq27.so`, Python and those
+  packages (1.21 GB on the nvidia/cuda base image, 456 MB of it the forward-compatibility driver package, which
+  GeForce GPUs do not use; 350 MB on ubuntu:24.04).
 - **The scheduler is Python.** A speculative step takes 12 to 25 ms; the scheduler's decisions take microseconds by
   comparison, and the engine queues the next step before the host reads the previous one ([§6](#6-a-decode-step)).
 
@@ -118,7 +125,8 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 
 At startup the engine computes a plan, allocates each pool once and never calls `cudaMalloc` while serving.
 
-- **Budget**: the free VRAM at startup minus `WDDM_MARGIN_GIB` (0.6 GiB), at most 30.3 GiB. If a configuration
+- **Budget**: the free VRAM at startup (with other programs counted: the server passes what NVML sees, since
+  `cudaMemGetInfo` does not count them, on WSL2 or on Windows) minus `WDDM_MARGIN_GIB` (0.6 GiB), at most 30.3 GiB. If a configuration
   does not fit, the engine stops with the breakdown in the log; the server's `MAX_TOKENS_FIT=1` instead lowers
   `MAX_TOKENS` to what fits.
 - **Pools** (separate, no padding to a common page size):
@@ -214,10 +222,18 @@ on Japanese prose (a property of the draft model, also seen in other engines).
 
 Prefill runs in chunks of 2,048 tokens through the same weights.
 
-- **GEMMs**: CUTLASS's SM120 block-scaled GEMMs with 128 x 128 x 128 tiles: FP4 for the MLP and the GDN
-  projections, and for FP8 the block-scaled MXFP8 kernel with unit scales (P5-11), which is bit-identical to the
-  plain FP8 GEMM and twice as fast on this GPU. Other tiles and splits made no difference: the GEMMs run at the
-  power limit (P5-3).
+- **GEMMs** (`gemm_mma.cu`, P5-12): the engine's own kernels on `mma.sync` with 128 x 128 tiles, TMA loads into a
+  ring of shared-memory stages filled by a producer warp, 8 MMA warps and TMA stores (or TMA reduce-adds for the
+  residual) in the epilogue. NVFP4 reads the swizzled block scales in place; E4M3 runs the block-scaled MXFP8 MMA
+  with unit scales (P5-11: bit-identical to the plain FP8 MMA and twice as fast on this GPU); BF16 (draft context,
+  vision) any N and K. The MLP's gate | up GEMM writes silu(gate) * up NVFP4-quantized from its epilogue. FP8
+  layers with per-output-channel weight scales and per-token activation scales (unsloth's and Red Hat's
+  checkpoints) take their own instantiation of the fp32 epilogue (acc * weight scale * activation scale), so the
+  other instantiations compile to the same code as before. Results
+  are bit-identical to those of CUTLASS's SM120 kernels, which they replaced: at 400 W they were 2.5-7% faster on
+  most prefill shapes (gdn z 1.8-2.7% and BF16 0.5-1% slower) and the prefill 0.6% / 0.0% faster at 19K / 73K. The K
+  loop keeps its stage arithmetic on the uniform datapath, the producer warp issues its loads from one elected lane
+  without a branch, and the tiles go N fastest unless the weights exceed L2. The GEMMs run at the power limit (P5-3), so instructions and bytes, not stalls, set their speed.
 - **Attention** (`attention.cu`, flash attention on tensor cores, `Q27_ATTN_FP8`):
   - FP8 KV cache (mode 2): Q K^T and P V on FP8 MMAs; K and V as stored, Q with a per-row scale, P scaled by 256
     into E4M3. Exponentials in f16x2 with base 2, masking only on the diagonal chunk (P5-10).
@@ -293,8 +309,15 @@ takes 47 ms (43 ms with the weights in VRAM, `VISION=bf16`); outputs are bit-ide
 `VISION=fp8` keeps E4M3 weights (per-row scales) in VRAM: 0.43 GiB, slightly less accurate, faster only for small
 images.
 
-- The image processor (resizing, patching) is the checkpoint's own in the server, so the inputs match the
-  reference.
+- The image processor is the checkpoint's own, so the inputs match the reference. The server reads only each
+  image's size from its header (enough for the grid and the token ids) and passes the encoded image on; the engine
+  process decodes and resizes (PIL bicubic, as transformers' PIL backend, on 8 threads with the same pixels as one
+  call) only the images it has to encode, starting while the request waits. A chat client resends the whole
+  history every turn: the images in a cached prefix cost nothing then (a follow-up turn with three 12 MP photos in
+  its history: 1.2 s before, 55 ms). The engine normalizes the resized uint8 RGB ((x - mean) / std in
+  fp32) and arranges the patches (2x2 merge blocks, repeated over the temporal patch) on the GPU, bit-identical to
+  the processor's fp32 `pixel_values` rounded to BF16. A 2048 x 2048 image is 12 MB to send instead of 100 MB of
+  fp32 patches, and the 0.3 s that numpy took for those on the CPU is gone.
 - Image tokens enter the prompt as out-of-vocabulary ids derived from the image's content. The prefix cache, which
   compares token ids, therefore distinguishes images without any change and skips encoding images that are already
   in a cached prefix. The embeddings are written to a pinned host table that the embedding gather reads.
@@ -312,8 +335,26 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
   turn's prompt (and the prefix cache) still has it.
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
+- OpenAI chat completions and completions also return llama.cpp's `timings` object (`cache_n`, `prompt_n`, `prompt_ms`,
+  `predicted_n`, `predicted_ms` and the rates), on the response or the last streamed chunk, which front-ends such as
+  llama-swap read. With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
+  bonus token, as llama.cpp counts them; they are left out without a draft and with `Q27_SPEC_PATHS` above 1.
 - `/metrics` exposes Prometheus metrics; `/admin/concurrency` reads and sets the admission settings. There is no
   authentication: the server is meant to listen on 127.0.0.1 for one user.
+- `/ui` is a stats page (`frontend/stats.py`, `frontend/ui/index.html`): the engine process sends a snapshot of its
+  requests, KV pool and device memory every 0.5 s while it works and its memory plan once at startup
+  (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
+  the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
+  process: it holds all the VRAM, the server none.
+- Start settings (`frontend/launch.py`): an engine can start with other weights, KV type, draft, vision tower,
+  `MAX_SEQS`, `MAX_TOKENS` or VRAM budget. What each leaves for the context comes from the engine's own memory
+  planner: `q27_plan` runs the constructor's planning (the pools, `MAX_TOKENS_FIT`, the KV pool) for a given free
+  and total device memory and stops before the first CUDA call, so the prediction is the startup log's numbers
+  exactly. A helper process runs the plans, since each sets the environment the engine reads.
+- Loading (`engine/src/prefetch.cc`): the loaders plan the byte ranges they read, `Q27_LOAD_THREADS` threads read
+  them ahead into pinned slots (the embedding straight into its pinned table), and the loaders upload them in plan
+  order as before. The prefix cache's pinned state slots (4 GiB) are allocated after startup, one by one while the
+  engine is idle (`q27_cache_grow`) or when a checkpoint needs one.
 
 ## 13. Correctness
 

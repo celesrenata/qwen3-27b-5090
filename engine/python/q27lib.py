@@ -1,16 +1,20 @@
-"""ctypes binding of libq27.so: the engine (Engine) and the kernel wrappers used by the tests (call)."""
+"""ctypes binding of libq27.so (q27.dll on Windows): the engine (Engine) and the kernel wrappers used by the tests (call)."""
 
 import array
 import ctypes
 import os
 
-LIB_PATH = os.environ.get("Q27_LIB", "/build/engine/libq27.so")
+# Windows: the CMake build in engine/build (cmake -S engine -B engine/build); Linux: the dev image's /build.
+_DEFAULT_LIB = (os.path.join(os.path.dirname(__file__), "../build/q27.dll") if os.name == "nt"
+                else "/build/engine/libq27.so")
+LIB_PATH = os.environ.get("Q27_LIB", _DEFAULT_LIB)
 # Draft vocabulary of the DFlash2 candidates (tools/draft_vocab.py); Q27_DRAFT_VOCAB=none: the full vocabulary.
 DRAFT_VOCAB = os.path.join(os.path.dirname(__file__), "../../bench/draft-vocab/vocab-128k.txt")
 
 P, I, I64, F, SZ = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float, ctypes.c_size_t
 SIGNATURES = {
     "q27_create": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p], P),
+    "q27_plan": ([ctypes.c_char_p, I, I, I, ctypes.c_char_p, I64, I64], P),
     "q27_spec_begin": ([P, P, I, F, I, F, ctypes.c_uint64, F, I, P], I),
     "q27_spec_step": ([P, P], I),
     "q27_spec_step2": ([P, P, I], I),
@@ -29,15 +33,21 @@ SIGNATURES = {
     "q27_prefix_begin": ([P, P, I, P, I, I, P], I),
     "q27_checkpoint": ([P], I),
     "q27_cache_stats": ([P, P], I),
+    "q27_cache_grow": ([P, I, P], I),
+    "q27_memory_report": ([P, ctypes.c_char_p, I], I),
+    "q27_device_memory": ([P, P], I),
     "q27_has_vision": ([P], I),
     "q27_mm_set": ([P, P, I], I),
     "q27_mm_encode": ([P, I, P], I),
+    "q27_mm_encode_rgb": ([P, I, P, P], I),
     "q27_mm_embeds": ([P, I, P], I),
     "q27_mm_put": ([P, I, P], I),
     "q27_debug_kv": ([P, I, I, I, P], I),
     "q27_debug_ssm": ([P, I, P], I),
     "q27t_skinny_bf16": ([I, I, I, P, P, P, P, SZ], I),
     "q27t_gemm_bf16": ([I, I, I, P, P, P], I),
+    "q27t_vision_pixels": ([P, P, P, I, I, P], I),
+    "q27t_gemm_bf16_ex": ([I, I, I, P, P, F, P, F, P], I),
     "q27t_gdn_verify": ([P, I, I, P, P, P, P, P, P] + [P] * 8 + [P, P, P, P, P, P, I, P, F, P, P, F, I], I),
     "q27t_topk_rows": ([P, I, I, I, P, P], I),
     "q27_destroy": ([P], None),
@@ -56,13 +66,19 @@ SIGNATURES = {
     "q27t_silu_mul": ([P, P, I64, P], I),
     "q27t_linear_bf16": ([P, P, I, I, I, P], I),
     "q27t_swizzle_sf": ([P, I, I, P], I),
+    "q27t_swizzle_sf_glu": ([P, I, I, P, I], I),
     "q27t_sf_bytes": ([I64, I64], I64),
-    "q27t_gemm_fp4": ([I, I, I, P, P, P, P, F, P, F, P, P, SZ], I),
-    "q27t_gemm_fp8": ([I, I, I, P, P, F, P, F, P, P, SZ], I),
-    "q27t_gemm_workspace_bytes": ([], SZ),
-    "q27t_gemm_workspace_init": ([P, SZ], I),
+    "q27t_gemm_fp4": ([I, I, I, P, P, P, P, F, P, F, P], I),
+    "q27t_gemm_fp8": ([I, I, I, P, P, F, P, F, P], I),
+    "q27t_gemm_fp4_glu": ([I, I, I, P, P, P, P, F, F, F, P, P], I),
     "q27t_skinny_fp4": ([I, I, I, P, P, P, P, F, P, F, P, P, SZ], I),
     "q27t_skinny_fp8": ([I, I, I, P, P, F, P, F, P, P, SZ], I),
+    "q27t_gemm_fp8_scaled": ([I, I, I, P, P, P, P, P, F, P], I),
+    "q27t_skinny_fp8_scaled": ([I, I, I, P, P, P, P, P, F, P, P, SZ], I),
+    "q27t_quant_fp8_rows": ([P, I64, I, I, P, P], I),
+    "q27t_silu_mul_quant_fp8_rows": ([P, P, I64, I, I, P, P], I),
+    "q27t_rmsnorm_quant_rows": ([P, P, I, F, P, P, P], I),
+    "q27t_dequant_fp8_rows": ([P, P, I, I, P], I),
     "q27t_bench_gemm": ([I, I, I, I, I, P, P, P, P, I64, I64, I, I, P, P, SZ, P], I),
     "q27t_gdn_prep": ([P, P, P, P, P, P, P, I, P, P, P, P, P], I),
     "q27t_gdn_recurrent": ([P, P, P, P, P, I, P, P], I),
@@ -74,7 +90,9 @@ SIGNATURES = {
     "q27t_rmsnorm_quant": ([P, P, I, F, P, I, F, P, P], I),
     "q27t_silu_mul_quant_fp4": ([P, P, I64, I, I, F, P, P], I),
     "q27t_silu_mul_quant_fp4_bf16": ([P, P, I64, I, I, F, P, P], I),
-    "q27t_gemm_fp4_bf16": ([I, I, I, P, P, P, P, F, P, P, SZ], I),
+    "q27t_silu_mul_quant_fp4_glu": ([P, I, I, F, F, F, P, P], I),
+    "q27t_silu_mul_quant_fp4_glu_bf16": ([P, I, I, F, F, F, P, P], I),
+    "q27t_gemm_fp4_bf16": ([I, I, I, P, P, P, P, F, P], I),
     "q27t_linear_bf16_pair": ([P, P, P, I, I, I, P, P], I),
     "q27t_attn_prep": ([P, P, P, P, P, I, I, P, P, I, P, P], I),
     "q27t_attention": ([P, P, I, I, P, P, I, P, P, P, SZ], I),
@@ -125,16 +143,28 @@ class Engine:
 
     def __init__(self, model_dir, max_tokens=32768, prefill_chunk=2048, kv_fp8=False, draft=None, kv_dtype=None):
         """kv_dtype: "bf16" | "fp8" | "nvfp4" (default: kv_fp8 picks fp8 or bf16)."""
+        self._create("q27_create", model_dir, max_tokens, prefill_chunk, kv_fp8, draft, kv_dtype)
+
+    @classmethod
+    def plan(cls, model_dir, free, total, max_tokens=32768, prefill_chunk=2048, kv_dtype="bf16", draft=None):
+        """The memory plan of Engine(...) (with the same environment) on a device with `free` of `total` bytes free
+        after the CUDA context, without CUDA: nothing is allocated or loaded. Its memory_report(), max_tokens,
+        cache_stats() and device_memory() answer; close() it."""
+        self = cls.__new__(cls)
+        self._create("q27_plan", model_dir, max_tokens, prefill_chunk, False, draft, kv_dtype, int(free), int(total))
+        return self
+
+    def _create(self, fn, model_dir, max_tokens, prefill_chunk, kv_fp8, draft, kv_dtype, *extra):
         self.max_tokens = max_tokens
         if draft and "Q27_DRAFT_VOCAB" not in os.environ and os.path.exists(DRAFT_VOCAB):
             os.environ["Q27_DRAFT_VOCAB"] = os.path.abspath(DRAFT_VOCAB)
         if os.environ.get("Q27_DRAFT_VOCAB") == "none":
             os.environ["Q27_DRAFT_VOCAB"] = ""
         kv = self.KV_TYPES[kv_dtype] if kv_dtype else int(bool(kv_fp8))
-        self.h = lib().q27_create(str(model_dir).encode(), max_tokens, prefill_chunk, kv,
-                                  str(draft).encode() if draft else None)
+        self.h = getattr(lib(), fn)(str(model_dir).encode(), max_tokens, prefill_chunk, kv,
+                                    str(draft).encode() if draft else None, *extra)
         if not self.h:
-            raise RuntimeError(f"q27_create: {lib().q27_last_error().decode()}")
+            raise RuntimeError(f"{fn}: {lib().q27_last_error().decode()}")
         self.max_tokens = lib().q27_max_tokens(self.h)  # (MAX_TOKENS_FIT=1 lowers it to what the VRAM fits)
 
     def close(self):
@@ -271,12 +301,49 @@ class Engine:
         """Saves a checkpoint of the sequence so far (e.g. after a generation)."""
         self._check(lib().q27_checkpoint(self.h), "q27_checkpoint")
 
+    def cache_grow(self, n=1):
+        """Allocates up to n more pinned state slots of the prefix cache (not allocated at startup; about 80 ms each
+        on WSL2); returns how many (0: all are)."""
+        out = ctypes.c_int()
+        self._check(lib().q27_cache_grow(self.h, n, ctypes.byref(out)), "q27_cache_grow")
+        return out.value
+
     def cache_stats(self):
-        out = (ctypes.c_int64 * 11)()
+        out = (ctypes.c_int64 * 12)()
         self._check(lib().q27_cache_stats(self.h, out), "q27_cache_stats")
         keys = ("lookups", "hits", "prompt_tokens", "cached_tokens", "saved", "evicted", "checkpoints", "free_pages",
-                "checkpoint_only_pages", "pool_pages", "park_pages")
+                "checkpoint_only_pages", "pool_pages", "park_pages", "slots_allocated")
         return dict(zip(keys, out))
+
+    def memory_report(self):
+        """The memory pools: {"pools": [{"name", "host", "bytes", "items": [(what, bytes)]}], "slots": state cache
+        slots, "checkpoint_bytes": bytes of one}. Fixed once the engine is created."""
+        cap = 1 << 20
+        while True:
+            buf = ctypes.create_string_buffer(cap)
+            n = lib().q27_memory_report(self.h, buf, cap)
+            if n < 0:
+                raise RuntimeError(f"q27_memory_report: {lib().q27_last_error().decode()}")
+            if n < cap:
+                break
+            cap = n + 1
+        pools, out = {}, {"pools": [], "slots": 0, "checkpoint_bytes": 0}
+        for line in buf.value.decode().splitlines():
+            f = line.split("\t")
+            if f[0] == "pool":
+                pools[f[1]] = {"name": f[1], "host": f[2] == "1", "bytes": int(f[3]), "items": []}
+                out["pools"].append(pools[f[1]])
+            elif f[0] == "item":
+                pools[f[1]]["items"].append((f[2], int(f[3])))
+            elif f[0] == "slots":
+                out["slots"], out["checkpoint_bytes"] = int(f[1]), int(f[2])
+        return out
+
+    def device_memory(self):
+        """{"free", "total"} device bytes now (cudaMemGetInfo), "free_at_start" (before the pools), "budget"."""
+        out = (ctypes.c_int64 * 4)()
+        self._check(lib().q27_device_memory(self.h, out), "q27_device_memory")
+        return dict(zip(("free", "total", "free_at_start", "budget"), out))
 
     @property
     def has_vision(self):
@@ -293,6 +360,11 @@ class Engine:
 
         pv = np.ascontiguousarray(np.asarray(pixel_values, dtype=np.float32))
         self._check(lib().q27_mm_encode(self.h, i, pv.ctypes.data), "q27_mm_encode")
+
+    def mm_encode_rgb(self, i, rgb, norm):
+        """Runs the vision tower on image i from the resized image: rgb [32 * gh][32 * gw][3] uint8 bytes, norm
+        mean[3] + std[3] (the server's image processor; normalized and arranged into patches on the device)."""
+        self._check(lib().q27_mm_encode_rgb(self.h, i, rgb, (ctypes.c_float * 6)(*norm)), "q27_mm_encode_rgb")
 
     def mm_embeds(self, i, rows):
         """Embeddings of image i as a uint16 (BF16 bits) numpy array [rows, 5120]."""

@@ -19,6 +19,9 @@ class Pool {
   // Planning: reserve `bytes` (256-byte aligned) and return the offset of the region.
   size_t add(const std::string& what, size_t bytes);
   void commit();
+  // Places the planned regions at `base` instead: memory of another committed pool that is unused while these are
+  // (not owned; e.g. load-time scratch in the KV pool before the first request).
+  void commit_at(void* base);
   void* base() const { return base_; }
   template <class T>
   T* at(size_t offset) const {
@@ -37,6 +40,7 @@ class Pool {
   bool host_;
   size_t size_ = 0;
   void* base_ = nullptr;
+  bool owned_ = true;
   std::vector<std::pair<std::string, size_t>> items_;
 };
 
@@ -44,10 +48,13 @@ struct Budget {
   size_t free_at_start = 0;   // cudaMemGetInfo free before any allocation
   size_t total = 0;
   size_t budget = 0;          // device bytes this process may allocate in pools
+  size_t asked = 0;           // VRAM_BUDGET_GIB, if it was above what is free (and so not used)
 };
 
-// VRAM_BUDGET_GIB (if set) or min(free - WDDM_MARGIN_GIB (0.6), 30.3 GiB minus the CUDA context).
+// min(free - WDDM_MARGIN_GIB (0.6), 30.3 GiB minus the CUDA context), or VRAM_BUDGET_GIB if that is lower.
 Budget make_budget();
+// The same for a device with `free` of `total` bytes free (after the CUDA context), without CUDA (Options::plan_only).
+Budget budget_for(size_t free, size_t total);
 
 // Prints a breakdown of all pools and fails if the device pools exceed the budget.
 void check_and_log(const Budget& b, const std::vector<Pool*>& pools);

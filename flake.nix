@@ -70,7 +70,7 @@
         fetchSubmodules = false;
       };
 
-      # --- engine: C++/CUDA shared library (libq27.so) + q27-sfcheck diagnostic tool ---
+      # --- engine: C++/CUDA shared library (libq27.so) ---
       engine = pkgs.stdenv.mkDerivation (finalAttrs: {
         pname = "qwen38-engine";
         version = "0.1.0";

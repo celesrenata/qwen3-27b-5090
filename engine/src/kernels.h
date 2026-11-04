@@ -32,12 +32,15 @@ struct SeqLanes {
 };
 
 // Quantized copy of an activation for the next GEMM (written by the op that produces it).
+// kFp8Row: FP8 with a scale per row (token) from its absolute maximum (amax / 448: the dynamic per-token
+// quantization of compressed-tensors FP8 checkpoints), written to `scale`; in_scale is not used.
 struct QuantOut {
-  enum Kind : int { kNone = 0, kFp8 = 1, kFp4 = 2 };
+  enum Kind : int { kNone = 0, kFp8 = 1, kFp4 = 2, kFp8Row = 3 };
   Kind kind = kNone;
   float in_scale = 1.f;
   uint8_t* q = nullptr;   // fp8 [T][D] / packed e2m1 [T][D/2]
   uint8_t* sf = nullptr;  // NVFP4 only: swizzled scale factors
+  float* scale = nullptr; // kFp8Row only: [T]
 };
 
 // ---------------------------------------------------------------- elementwise (kernels.cu)
@@ -51,6 +54,10 @@ void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_c
 // Dynamic NVFP4 quantization (modelopt / FlashInfer numerics, see reference/qwen27b/quant.py):
 // q [M][K/2] packed e2m1 (low nibble = even column), sf in the CUTLASS SM1xx swizzled layout.
 void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+// A BF16 weight matrix [M][K] to NVFP4 (Weights::fp4_from_bf16), global = its weight_scale_2 (amax / 2688), the
+// block scales searched for the smallest error. The scale factors of rows m0.. of a larger matrix start at
+// sf + sf_bytes(m0, K / 16) when m0 is a multiple of 128.
+void quant_fp4_weight(const bf16* w, int M, int K, float global, uint8_t* q, uint8_t* sf, cudaStream_t s);
 // Zero-centered RMSNorm over the hidden size (5120) per token, writing the fp32 result to `out` (may be
 // null) and the quantized activation (same numerics as rmsnorm + quant_fp4 / quant_fp8).
 // cap (optional): a BF16 copy of the input rows x (the residual stream), rows cap_ld elements apart.
@@ -61,8 +68,23 @@ void silu_mul_quant_fp4(const float* gate, const float* up, int64_t ld, int T, i
                         uint8_t* sf, cudaStream_t s);
 void silu_mul_quant_fp4(const bf16* gate, const bf16* up, int64_t ld, int T, int I, float input_scale, uint8_t* q,
                         uint8_t* sf, cudaStream_t s);
+// The same from the [T][2 I] output of the interleaved gate | up weights (glu_row: gate and up in alternate blocks
+// of 64 rows), with the gate's and the up's alphas applied here (the GEMM ran with alpha 1).
+void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
+                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
+                            uint8_t* q, uint8_t* sf, cudaStream_t s);
 // x' = e4m3(x / input_scale), [n] elements.
 void quant_fp8(const float* x, int64_t n, float input_scale, uint8_t* q, cudaStream_t s);
+// Dynamic per-row FP8 (QuantOut::kFp8Row): scale[t] = amax(row t) / 448 (1 for an all-zero row),
+// q[t] = e4m3(x[t] / scale[t]); x rows ld floats apart, q rows K bytes apart (K a multiple of 16).
+void quant_fp8_rows(const float* x, int64_t ld, int T, int K, uint8_t* q, float* scale, cudaStream_t s);
+// The same of silu(gate) * up ([T][I], gate / up rows ld floats apart): the down GEMM's input of an FP8 MLP.
+void silu_mul_quant_fp8_rows(const float* gate, const float* up, int64_t ld, int T, int I, uint8_t* q, float* scale,
+                             cudaStream_t s);
+// out[r][k] = BF16(e4m3 w[r][k] * scale[r]) for an FP8 weight with per-row (output channel) scales: the input of
+// quant_fp4_weight for an NVFP4 copy (the draft model's view of an FP8 lm_head).
+void dequant_fp8_rows(const uint8_t* w, const float* scale, int rows, int K, bf16* out, cudaStream_t s);
 // out = silu(gate) * up, [n] elements.
 void silu_mul(const float* gate, const float* up, int64_t n, float* out, cudaStream_t s);
 // out[t][n] = x[t] . w[n] for a small BF16 weight [N][K] (GDN in_proj_a / in_proj_b).
@@ -82,8 +104,16 @@ void add_pos_dev(int32_t* pos, const int32_t* n, cudaStream_t s);
 // Exchanges two device buffers in place (16-byte aligned, bytes a multiple of 16): parking a sequence's
 // state while resuming another one (Model::seq_swap).
 void swap_bytes(void* a, void* b, size_t bytes, cudaStream_t s);
-// Reorders row-major e4m3 scale factors [rows][kblocks] into the CUTLASS swizzled layout.
-void swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst, cudaStream_t s);
+// The MLP's gate | up weights are stored interleaved (Weights::fp4_glu): blocks of 64 rows, gate and up in turn,
+// so that a 128-row tile (and its 128-row scale atom) holds the gate and the up rows of the same 64 outputs
+// (the fused prefill GEMM gemm_fp4_glu_mma reads one scale atom per tile instead of two half-used ones).
+// Row r of the gate (half 0) or the up (half 1) is row glu_row(r, half); column c of the gate in the GEMM's
+// output is gate_glu_offset(c) (the up 64 further).
+__host__ __device__ inline int64_t glu_row(int64_t r, int half) { return (r / 64) * 128 + half * 64 + r % 64; }
+__host__ __device__ inline int64_t gate_glu_offset(int64_t c) { return glu_row(c, 0); }
+// Reorders row-major e4m3 scale factors [rows][kblocks] into the CUTLASS swizzled layout (glu_half 0 / 1: the
+// rows of the gate / the up into the interleaved gate | up, dst its start).
+void swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst, cudaStream_t s, int glu_half = -1);
 // Byte offset of scale factor (row, kblock) in the swizzled layout (host and device).
 __host__ __device__ inline int64_t sf_offset(int64_t row, int64_t kb, int64_t kblocks) {
   int64_t katoms = (kblocks + 3) / 4;
@@ -94,20 +124,28 @@ inline int64_t sf_bytes(int64_t rows, int64_t kblocks) {
   return ((rows + 127) / 128) * 128 * ((kblocks + 3) / 4) * 4;
 }
 
-// ---------------------------------------------------------------- GEMM (gemm.cu, CUTLASS SM120)
+// ---------------------------------------------------------------- GEMM (prefill, gemm_mma.cu)
 
-// D[M][N] = alpha * A[M][K] . B[N][K]^T + beta * C[M][N] (fp32, row-major; C may alias D or be null).
+// D[M][N] = alpha * A[M][K] . B[N][K]^T + beta * C[M][N] (fp32, row-major; C may alias D or be null), on mma.sync
+// (N and K multiples of 128).
 void gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-              float alpha, const float* c, float beta, float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+              float alpha, const float* c, float beta, float* d, cudaStream_t s);
 // The same with BF16 output (no C).
 void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                   float alpha, bf16* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+                   float alpha, bf16* d, cudaStream_t s);
 void gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-              float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
-size_t gemm_workspace_bytes(int max_m);
-// Fills the MXFP8 unit scales of a workspace of gemm_workspace_bytes (gemm_fp8 then runs block-scaled).
-void gemm_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s);
-// BF16 x BF16 -> fp32 for many rows (gemm_bf16.cu): D[M][N] = alpha * A[M][K] . W[N][K]^T + beta * C.
+              float* d, cudaStream_t s);
+// FP8 with per-row activation scales and per-output-channel weight scales (compressed-tensors FP8 "channel"
+// weights, dynamic "token" activations): D = (A . B^T) * (wscale[n] * ascale[m]) + beta * C.
+void gemm_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* b, const float* wscale,
+                     const float* c, float beta, float* d, cudaStream_t s);
+// The MLP's gate | up GEMM with silu(gate) * up NVFP4-quantized in the epilogue: gate_up is the [2 I][K]
+// weight (gate rows, then up rows; scales likewise), q [M][I / 2] and q_sf (swizzled) the down GEMM's
+// activations, quantized with the global scale out_scale (I a multiple of 128).
+void gemm_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                  const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                  uint8_t* q_sf, cudaStream_t s);
+// BF16 x BF16 -> fp32 for many rows (N and K multiples of 8): D[M][N] = alpha * A[M][K] . W[N][K]^T + beta * C.
 void gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                cudaStream_t s);
 
@@ -137,6 +175,9 @@ void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const A
 // scales, per-token activation scales of the dynamic quantization).
 void skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w, const float* wscale,
                        float* d, void* ws, size_t ws_bytes, cudaStream_t s);
+// The same with a residual (+ beta * C): the target's FP8 layers with per-channel scales (gemm_fp8_scaled).
+void skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w, const float* wscale,
+                       const float* c, float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const float* ascale, const uint8_t* w,
                        const uint8_t* w_sf, const float* wscale, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 // BF16 activations [M][K] x BF16 weights [N][K] (the draft model).

@@ -24,7 +24,10 @@ starts. A request waiting for room rather than one suspended later keeps its tur
 
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
 Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids]), ("done", rid, finish, info),
-("error", rid, message), ("metrics", dict), ("config", settings, n: the change answered, or None).
+("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
+("error", rid, message[, HTTP status: 400 for an image that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
+("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
+("event", rid, kind, text: an admission wait, a preemption, an engine error).
 """
 
 import array
@@ -39,12 +42,18 @@ PREFILL, DECODE = "prefill", "decode"
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
 RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages over
+STATS_INTERVAL = 0.5  # s between stats snapshots (the stats UI) while requests run
+STATS_IDLE = 5.0      # s between them while idle
 
 
 def step_ms(n):
     """Time of a batched step for n requests (short contexts, gdnfp4 + KV nvfp4, P7-11: 12.40 / 13.76 / 16.39 /
     21.99 ms for 1 / 2 / 4 / 8): scales a measured rate per request to a number of requests not measured yet."""
     return 11.1 + 1.36 * n
+
+
+class ImageError(Exception):
+    """An image of the request cannot be decoded (the client's error: 400)."""
 
 
 def log(msg):
@@ -60,7 +69,8 @@ class Seq:
         self.max_new = req["max_new"]
         self.temperature, self.top_k, self.top_p = req["temperature"], req["top_k"], req["top_p"]
         self.rng = random.Random(req.get("seed"))
-        self.images = req.get("images")  # (spans [(start, gh, gw)], pixel arrays) or None
+        self.images = req.get("images")  # (spans [(start, gh, gw)], [(encoded image, resized size, norm)]) or None
+        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), started on arrival
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
@@ -79,6 +89,12 @@ class Seq:
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
         self._bytes = None
+        self.begun = None        # time of the first prefix_begin
+        self.computed = 0        # prompt tokens prefilled (not restored from the cache)
+        self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
+        self.steps = 0           # decode steps (speculative: verify steps)
+        self.drafted = self.draft_accepted = 0  # draft tokens verified, and those accepted (as llama.cpp counts them)
+        self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
 
     def rest(self):
         return len(self.eng_ids) - (self.fed if self.started else self.est_cached)
@@ -94,10 +110,16 @@ class Scheduler:
         from q27lib import Engine, KvFull
 
         self.conn, self.cfg, self.KvFull = conn, cfg, KvFull
-        os.environ.update(cfg.get("env", {}))
+        for k, v in cfg.get("env", {}).items():  # (the start settings, launch.py; None: unset)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
+        # Draft tokens of a verify step: a chain of 7. Several paths verify a tree: not reported.
+        self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
         self.engine_seqs = max(1, min(cfg["max_seqs"], self.engine.park_slots + 1))
         self.max_seqs = self.engine_seqs  # the target number of running requests (<= engine_seqs)
         self.admit_kv, self.kv_reserve, self.min_tps = True, 4096, 0.0
@@ -117,8 +139,10 @@ class Scheduler:
         self.cur = None          # the sequence in the engine's working state (may be finished)
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
+        self.decoder = None      # threads that decode images (prefetch)
         self.m = collections.Counter()
-        self.last_metrics = 0.0
+        self.last_metrics = self.last_stats = 0.0
+        self.cache_full = False  # every state slot of the prefix cache allocated (poll)
 
     # ------------------------------------------------------------ messages
 
@@ -126,8 +150,13 @@ class Scheduler:
         self.conn.send(msg)
 
     def poll(self, block):
+        # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
+        # then wake up now and then for a stats snapshot.
+        if block and not self.cache_full:
+            self.cache_full = self.engine.cache_grow(1) == 0
+            block = self.cache_full
         if block:
-            self.conn.poll(None)
+            self.conn.poll(STATS_IDLE)
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
@@ -158,10 +187,33 @@ class Scheduler:
                 o.at = sorted(set(o.at) | {s.share_len})
             s.reusable = s.share_len
         s.at = self.checkpoints(s.prompt, s.reusable)
+        # (stats: where the first message ends, the last message and the generation prompt start)
+        starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
+        s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
         s.est_cached = s.reusable
+        if s.images:
+            self.prefetch(s)
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def prefetch(self, s):
+        """Starts decoding the images that lie past the reusable prefix, which begin() will likely encode, on
+        threads while the request waits (images inside the prefix are decoded only if the cache misses them)."""
+        import imageproc
+
+        if self.decoder is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self.decoder = ThreadPoolExecutor(2, thread_name_prefix="image")
+        for i, ((start, gh, gw), (raw, size, _)) in enumerate(zip(*s.images)):
+            if start + gh * gw > s.reusable:
+                s.decoding[i] = self.decoder.submit(imageproc.rgb, raw, size)
+
+    def drop_decoding(self, s):
+        for f in s.decoding.values():
+            f.cancel()
+        s.decoding.clear()
 
     def cancel(self, rid):
         s = self.by_id.get(rid)
@@ -206,6 +258,7 @@ class Scheduler:
             s.held = True
             self.m[f'q27:admission_waits_total{{reason="{reason}"}}'] += 1
             log(f"{s.rid}: waits for room ({reason}), {len(self.alive)} running")
+            self.send("event", s.rid, "wait", f"waits for room ({reason}), {len(self.alive)} running")
         self.blocked = reason
         self.held_until = (s, time.time() + ADMIT_RECHECK) if reason else (None, 0.0)
         return reason is None
@@ -288,6 +341,7 @@ class Scheduler:
     def run(self):
         self.send("ready", {"max_tokens": self.engine.max_tokens, "max_seqs": self.engine_seqs, "spec": self.spec,
                             "vision": self.engine.has_vision})
+        self.send("memory", self.engine.memory_report())
         self.send("config", self.settings(), None)
         log(f"{self.engine_seqs} sequences at once (target {self.max_seqs}, KV admission {'on' if self.admit_kv else 'off'}, "
             f"min {self.min_tps:g} tok/s per request), decode share {self.share}, quantum {self.quantum * 1000:.0f} ms, "
@@ -302,9 +356,18 @@ class Scheduler:
             job = self.pick()
             if job:
                 self.guarded(*job)
-            if time.time() - self.last_metrics > 2.0:
-                self.send("metrics", self.metrics())
-                self.send("config", self.settings(), None)
+            # (stats also once more when the work is done, and after each idle wait)
+            self.report(force=not (self.alive or self.waiting))
+
+    def report(self, force=False):
+        """Metrics and admission settings every 2 s, stats snapshots every STATS_INTERVAL (also from inside a
+        long decode turn: one request alone decodes until it ends or a message arrives)."""
+        now = time.time()
+        if now - self.last_metrics > 2.0:
+            self.send("metrics", self.metrics())
+            self.send("config", self.settings(), None)
+        if force or now - self.last_stats > STATS_INTERVAL:
+            self.send("stats", self.stats())
 
     def can_prefill(self, s):
         o = s.share_with
@@ -363,12 +426,20 @@ class Scheduler:
                 self.suspend(victim)
                 if victim is s:
                     return None
+            except ImageError as e:  # (an image the server could read the size of but not decode)
+                log(f"{s.rid}: {e}")
+                self.send("error", s.rid, str(e), 400)
+                self.finish(s, "error", save=False, notify=False)
+                self.engine.reset()
+                self.cur = None
+                return None
             except RuntimeError as e:
                 msg = str(e)
                 if "check failed" not in msg:  # a CUDA error: the context is unusable, restart the process
                     raise
                 for o in s if kind == "batch" else [s]:
                     log(f"{o.rid}: {msg}")
+                    self.send("event", o.rid, "error", msg)
                     self.send("error", o.rid, msg)
                     self.finish(o, "error", save=False, notify=False)
                 self.engine.reset()
@@ -404,7 +475,7 @@ class Scheduler:
         self.cur = s
         s.started, s.fed = True, cached
         if s.cached is None:
-            s.cached = cached
+            s.cached, s.begun = cached, time.time()
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.m["q27:reusable_tokens_total"] += s.reusable
@@ -412,19 +483,29 @@ class Scheduler:
                 f"waited {time.time() - s.arrival:.2f} s, checkpoints at {s.at}")
             self.send("start", s.rid, {"cached": cached})
         if s.images:
-            spans, pixels = s.images
+            import imageproc
+
+            spans, srcs = s.images
             self.engine.mm_set(spans)
-            t0, encoded = time.time(), 0
+            t0, encoded, waited = time.time(), 0, 0.0
             for i, (start, gh, gw) in enumerate(spans):
                 if start + gh * gw > cached:  # (images inside the restored prefix need no embeddings)
-                    self.engine.mm_encode(i, pixels[i])
+                    raw, size, norm = srcs[i]
+                    t1, f = time.time(), s.decoding.pop(i, None)
+                    try:
+                        rgb = f.result() if f is not None else imageproc.rgb(raw, size)
+                    except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                        raise ImageError(f"cannot decode image: {e}") from e
+                    waited += time.time() - t1
+                    self.engine.mm_encode_rgb(i, rgb, norm)
                     encoded += 1
+            self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
             log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
-                f"in {time.time() - t0:.3f} s")
+                f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")
 
     def prefill_turn(self, s):
         self.load(s)
-        t0 = time.time()
+        t0, fed0 = time.time(), s.fed
         rest = s.eng_ids[s.fed:]
         if len(rest) > self.chunk:
             s.fed += self.engine.prefill(rest, self.chunk, spec=self.spec)
@@ -443,6 +524,15 @@ class Scheduler:
             self.emit(s, [tok])
         dt = time.time() - t0
         s.last_run = time.time()
+        s.prefill_s += dt
+        s.computed += s.fed - fed0
+        if s.phase == DECODE and not s.dead:
+            # The server answers a request its stop string ends with this and its own count of the steps after
+            # it, rather than wait for "done", which follows the cancel only after the engine's next step.
+            self.send("prefilled", s.rid, {"ttft": s.first_token - s.arrival, "prefill_s": s.prefill_s,
+                                           "computed_tokens": s.computed, "drafted": s.drafted,
+                                           "draft_accepted": s.draft_accepted, "draft_block": self.draft_block if self.spec else 0})
+        self.m["q27:prefill_tokens_total"] += s.fed - fed0
         if any(o.phase == DECODE for o in self.alive if o is not s):
             self.credit += self.share * dt
 
@@ -460,14 +550,18 @@ class Scheduler:
             if self.spec:
                 toks = self.engine.spec_step(ahead=not last)
                 self.m["q27:spec_verify_calls_total"] += 1
+                self.count_draft(s, toks)
             else:
                 toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random())]
             step = max(step * 0.8, time.time() - ts)
+            s.steps += 1
             self.emit(s, toks)
             if last:
                 break
+            self.report()
         dt = time.time() - t0
         s.last_run = time.time()
+        s.decode_s += dt
         if not others and self.spec:
             self.measure(1, len(s.out) - n0, dt)
         if has_prefill:
@@ -486,6 +580,8 @@ class Scheduler:
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
             for s, toks in zip(seqs, new):
+                s.steps += 1
+                self.count_draft(s, toks)
                 self.emit(s, toks)
             if any(s.dead for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
                 break
@@ -493,8 +589,14 @@ class Scheduler:
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)
         for s in seqs:
             s.last_run = time.time()
+            s.decode_s += dt
         if has_prefill:
             self.credit -= dt
+
+    def count_draft(self, s, toks):
+        """A verify step's tokens are the accepted drafts and the bonus token."""
+        s.drafted += self.draft_block
+        s.draft_accepted += len(toks) - 1
 
     def emit(self, s, toks):
         """Tokens of a step: stops at EOS and at max_new; the rest goes to the server."""
@@ -519,6 +621,7 @@ class Scheduler:
         waits at the head of the queue (the admission lets it in again) as a prompt of its prompt + output."""
         saved = len(v.eng_ids) if v.phase == DECODE else v.fed
         log(f"{v.rid}: preempted at {saved} tokens (KV pool full)")
+        self.send("event", v.rid, "preempt", f"preempted at {saved} tokens (KV pool full)")
         if v is self.cur:
             self.engine.checkpoint()
             self.engine.reset()
@@ -539,6 +642,7 @@ class Scheduler:
         if s.dead:
             return
         s.dead = True
+        self.drop_decoding(s)
         if s in self.alive:
             self.alive.remove(s)
         self.by_id.pop(s.rid, None)
@@ -555,7 +659,9 @@ class Scheduler:
         now = time.time()
         info = {"prompt_tokens": len(s.prompt), "completion_tokens": len(s.out), "cached_tokens": s.cached or 0,
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,
-                "preempted": s.preempted}
+                "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
+                "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
+                "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted}
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
@@ -577,6 +683,33 @@ class Scheduler:
         return out
 
 
+    def stats(self):
+        """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
+        self.last_stats = now = time.time()
+        st = self.engine.cache_stats()
+        seqs = []
+        for s in self.alive + list(self.waiting):
+            if s.dead:
+                continue
+            state = "waiting" if s not in self.alive else ("running" if s is self.cur else
+                                                          "parked" if s.area is not None else "admitted")
+            seqs.append({"rid": s.rid, "state": state, "phase": s.phase, "prompt": len(s.prompt),
+                         "cached": s.cached if s.cached is not None else s.est_cached,
+                         "fed": min(s.fed, len(s.prompt)) if s.started else 0, "out": len(s.out),
+                         "max_new": s.max_new, "computed": s.computed, "reusable": s.reusable,
+                         "age": now - s.arrival, "queued": (s.begun or now) - s.arrival,
+                         "ttft": (s.first_token - s.arrival) if s.first_token else None,
+                         "decode_wall": (now - s.first_token) if s.first_token else 0.0,
+                         "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
+                         "preempted": s.preempted, "held": s.held and s in self.waiting,
+                         "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
+                         "marks": s.marks})
+        return {"t": now, "seqs": seqs, "cache": st, "device": self.engine.device_memory(),
+                "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked,
+                "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
+                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"]}
+
+
 def lcp_bytes(a, b):
     """Common prefix of two int32 byte strings, in tokens."""
     lo, hi = 0, min(len(a), len(b)) // 4
@@ -593,10 +726,12 @@ def run(conn, cfg):
         Scheduler(conn, cfg).run()
     except SystemExit:
         raise
-    except BaseException:  # noqa: BLE001 - report and exit; the server starts a new engine
-        traceback.print_exc()
+    except BaseException as e:  # noqa: BLE001 - report and exit; the server starts a new engine
+        refused = "not enough VRAM" in str(e)
+        if not refused:
+            traceback.print_exc()
         try:
-            conn.send(("fatal", traceback.format_exc(limit=3)))
+            conn.send(("refused", str(e)) if refused else ("fatal", traceback.format_exc(limit=3)))
         except OSError:
             pass
         os._exit(1)

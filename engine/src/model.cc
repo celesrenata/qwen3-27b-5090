@@ -1,6 +1,7 @@
 #include "model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "common.h"
+#include "fs.h"
 #include "json.h"
 
 namespace q27 {
@@ -32,11 +34,11 @@ Model::Model(const Options& opt) : opt_(opt) {
   Q27_CHECK(opt.prefill_chunk > 0 && opt.prefill_chunk % 128 == 0, "prefill_chunk must be a multiple of 128");
   Q27_CHECK(opt.logits_rows > 0 && opt.logits_rows % 128 == 0 && opt.logits_rows <= opt.prefill_chunk,
             "logits_rows must be a multiple of 128 and <= prefill_chunk");
-  Budget budget = make_budget();
-  Q27_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
+  Budget budget = vram_ = opt.plan_only ? budget_for(opt.plan_free, opt.plan_total) : make_budget();
+  if (!opt.plan_only) Q27_CUDA(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking));
   ckpt_ = std::make_unique<SafeTensors>(opt.model_dir);
   // End-of-sequence ids (speculative steps end at an accepted one).
-  if (std::ifstream f(opt.model_dir + "/generation_config.json"); f) {
+  if (std::ifstream f(fs_path(opt.model_dir + "/generation_config.json")); f) {
     const Json gc = Json::parse(std::string(std::istreambuf_iterator<char>(f), {}));
     if (gc.has("eos_token_id")) {
       const Json& e = gc["eos_token_id"];
@@ -46,10 +48,19 @@ Model::Model(const Options& opt) : opt_(opt) {
         stop_[0] = int32_t(e.as_int());
     }
   }
-  if (const char* lm = getenv("Q27_LM_HEAD_CKPT"); lm && *lm && ckpt_->info("lm_head.weight").dtype == "BF16")
+  if (const std::string lm = env_path("Q27_LM_HEAD_CKPT"); !lm.empty() && ckpt_->info("lm_head.weight").dtype == "BF16")
     lm_ckpt_ = std::make_unique<SafeTensors>(lm);
-  w_.plan(*ckpt_, lm_ckpt_.get(), dev_weights_, host_weights_);
+  // (With a draft vocabulary the draft model reads the target's lm_head only to build its own head at load.)
+  const bool draft_vocab = !opt.draft_dir.empty() && !env_path("Q27_DRAFT_VOCAB").empty();
+  w_.plan(*ckpt_, lm_ckpt_.get(), dev_weights_, host_weights_, !opt.draft_dir.empty(),
+          draft_vocab ? &load_tmp_ : nullptr);
   if (w_.fp4_proj) log("GDN / attention projections: NVFP4");
+  if (w_.dyn8) {
+    int n = 0;
+    for (const auto& L : w_.layers) n += L.mlp8;
+    log("FP8 layers with per-channel scales, activations quantized per token (%s%d FP8 MLPs)",
+        n == kLayers ? "all " : "", n);
+  }
   if (opt.vision) {
     Q27_CHECK(ckpt_->config()["image_token_id"].as_int() == kImagePad, "unexpected image_token_id");
     Q27_CHECK(opt.image_tokens > 0 && opt.image_max_pixels >= 4 * 256, "image_tokens / image_max_pixels");
@@ -115,15 +126,15 @@ Model::Model(const Options& opt) : opt_(opt) {
   size_t o_n = f32("n", Tc * kVHeads * kVDim);
   size_t o_a = f32("a", Tc * kVHeads), o_bb = f32("b", Tc * kVHeads), o_g = f32("g", Tc * kVHeads),
          o_beta = f32("beta", Tc * kVHeads);
-  size_t o_aq = act_.add("act quant", size_t(Tp) * std::max(kInter / 2, kHeads * kHeadDim));
+  // (an FP8 MLP's down GEMM takes [T][I] bytes)
+  size_t o_aq = act_.add("act quant", size_t(Tp) * (w_.mlp8 ? kInter : std::max(kInter / 2, kHeads * kHeadDim)));
   size_t o_asf = act_.add("act sf", size_t(sf_bytes(Tp, kInter / 16)));
+  size_t o_asc = w_.dyn8 ? f32("act row scales", Tp) : 0;
   size_t o_ids = act_.add("ids", Tc * 4);
   size_t o_mpos = act_.add("mrope positions", Tc * 3 * 4);
   size_t o_logits = f32("logits", L * kVocab);
   size_t o_tki = act_.add("topk ids", L * 64 * 4), o_tkl = f32("topk logp", L * 64);
   size_t o_u = f32("uniform", 1), o_sm = act_.add("sampled", 4);
-  ws_bytes_ = gemm_workspace_bytes(int(Tc));
-  size_t o_ws = act_.add("gemm workspace", ws_bytes_);
   size_t o_sws = act_.add("skinny workspace", kSkinnyWsBytes);
   size_t o_aws = act_.add("attention workspace", kAttnDecodeWsBytes);
   // NVFP4 KV (P7-8): the prefill attention reads the context rounded to E4M3 from here: V only (1 KiB / token)
@@ -176,7 +187,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   // sized by max_pages_ above stays as planned (a few hundred KiB more than needed).
   if (opt.fit_max_tokens && opt.kv_pool_tokens <= 0 && left_pages < max_pages_) {
     const int fit = (left_pages * kPageTokens - kSpecBlock) / 1024 * 1024;
-    Q27_CHECK(fit >= opt.prefill_chunk, "MAX_TOKENS_FIT: the VRAM budget leaves no room for the KV pool");
+    if (fit < opt.prefill_chunk) fail("not enough VRAM: the VRAM budget leaves no room for the KV pool (MAX_TOKENS_FIT)");
     log("max_tokens %d does not fit the VRAM budget: lowered to %d (MAX_TOKENS_FIT)", opt.max_tokens, fit);
     opt_.max_tokens = fit;
     max_pages_ = int(ceil_div(fit + kSpecBlock, kPageTokens));
@@ -192,26 +203,43 @@ Model::Model(const Options& opt) : opt_(opt) {
     kv_pages -= kv_block_;
   // Without the prefix cache (tests) the pool holds max_tokens (or KV_POOL_TOKENS) with every area in use.
   const int kv_total = cache_on_ && opt.kv_pool_tokens <= 0 ? kv_pages : kv_pages + park_all;
-  Q27_CHECK(kv_total - park_all >= kv_block_, "the KV pool does not hold the parking areas (MAX_SEQS)");
+  if (kv_total - park_all < kv_block_) fail("not enough VRAM: the KV pool does not hold the parking areas (lower MAX_SEQS)");
   pool_pages = kv_total - 1;
+  if (int64_t(pool_pages) * kPageTokens < opt.min_kv_tokens)
+    fail("not enough VRAM: the KV pool would hold " + std::to_string(int64_t(pool_pages) * kPageTokens) +
+         " tokens, MIN_KV_TOKENS is " + std::to_string(opt.min_kv_tokens) + " (VRAM budget " +
+         std::to_string(budget.budget >> 20) + " MiB; other programs may be using the GPU)");
   const char* high = getenv("Q27_PAGES_HIGH");
   pool_.init(kv_total, high && atoi(high) != 0);
   const size_t o_kv = kv_.add("K | V pages (and parking areas)", size_t(kv_total) * per_page);
+  if (opt.plan_only) {  // (the caller compares the device pools with the budget, as check_and_log does)
+    slot_used_.assign(slots, false);
+    return;
+  }
 
   check_and_log(budget, {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_});
-  for (Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_})
-    p->commit();
+  // The pinned state cache (host_cache_, 4 GiB: about 1.8 s to pin on WSL2, and other CUDA calls wait meanwhile) is
+  // not committed: its slots are allocated one by one when a checkpoint needs one or while the server is idle
+  // (grow_state_cache), so the engine is ready that much sooner.
+  auto since = [](auto t) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); };
+  auto t_commit = std::chrono::steady_clock::now();
+  for (Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_mm_}) p->commit();
+  log("pools allocated in %.2f s", since(t_commit));
+  if (load_tmp_.size()) {
+    Q27_CHECK(load_tmp_.size() <= kv_.size(), "the KV pool is smaller than the load-time scratch");
+    load_tmp_.commit_at(kv_.base());
+  }
   log("kv pool: %d pages (%d tokens), max_tokens %d%s", pool_pages, pool_pages * kPageTokens, opt_.max_tokens,
       cache_on_ ? "" : " (prefix cache off)");
   if (cache_on_) {
     stage_ = state_.at<char>(o_stage);
-    host_slots_ = host_cache_.at<char>(0);
     slot_used_.assign(slots, false);
+    slot_mem_.assign(slots, nullptr);
     Q27_CUDA(cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_in_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
-    log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned), checkpoint interval %d", slots,
+    log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned, allocated as needed), checkpoint interval %d", slots,
         ckpt_bytes_ / 1048576.0, slots * double(ckpt_bytes_) / (1 << 30), opt.checkpoint_interval);
   }
 
@@ -242,6 +270,7 @@ Model::Model(const Options& opt) : opt_(opt) {
   n_ = act_.at<float>(o_n), a_ = act_.at<float>(o_a), b_ = act_.at<float>(o_bb), g_ = act_.at<float>(o_g);
   beta_ = act_.at<float>(o_beta);
   aq_ = act_.at<uint8_t>(o_aq), asf_ = act_.at<uint8_t>(o_asf);
+  if (w_.dyn8) ascale_ = act_.at<float>(o_asc);
   ids_ = act_.at<int32_t>(o_ids);
   mpos_ = act_.at<int32_t>(o_mpos);
   if (opt.vision) {
@@ -255,8 +284,6 @@ Model::Model(const Options& opt) : opt_(opt) {
   logits_ = act_.at<float>(o_logits);
   topk_ids_ = act_.at<int32_t>(o_tki), topk_logp_ = act_.at<float>(o_tkl);
   uniform_ = act_.at<float>(o_u), sampled_ = act_.at<int32_t>(o_sm);
-  ws_ = act_.at<void>(o_ws);
-  gemm_workspace_init(ws_, ws_bytes_, s_);
   skinny_ws_ = act_.at<void>(o_sws);
   attn_ws_ = act_.at<void>(o_aws);
   if (fa_stage_bytes_) fa_stage_ = act_.at<void>(o_fst);
@@ -305,11 +332,16 @@ Model::Model(const Options& opt) : opt_(opt) {
 
   Q27_CUDA(cudaMemset(page_table_, 0, size_t(max_pages_) * 4));  // all unmapped (pages come from pool_)
   Q27_CUDA(cudaMemset(asf_, 0, sf_bytes(Tp, kInter / 16)));
+  if (ascale_) Q27_CUDA(cudaMemset(ascale_, 0, size_t(Tp) * 4));
 
   w_.load(s_);
   if (draft_) {
     draft_->load(s_);
     draft_->build_vocab_head(w_.lm_head.w, w_.lm_head.sf, s_);
+    if (load_tmp_.size()) {  // (the copy was in the KV pool: nothing reads it from here on)
+      Q27_CHECK(draft_->has_vocab(), "the draft vocabulary was not loaded");
+      w_.lm_head.w = nullptr, w_.lm_head.sf = nullptr;
+    }
   }
   reset();
 
@@ -342,6 +374,7 @@ void Model::configure() {
   spec_paths_ = std::clamp(env_int("Q27_SPEC_PATHS", 1), 1, kTreePaths);
   spec_pipeline_ = env_int("Q27_SPEC_PIPELINE", 1) != 0;
   mlp_bf16_ = env_int("Q27_MLP_BF16", 1) != 0;
+  mlp_fused_ = env_int("Q27_MLP_FUSED", 1) != 0;
   const char* prof = getenv("Q27_PROFILE");
   prof_.on = prof && *prof && *prof != '0';
   graphs_ = !getenv("Q27_NO_GRAPH") && !skinny_check_;
@@ -358,6 +391,8 @@ Model::~Model() {
   if (b_out_) cudaFreeHost(b_out_);
   if (host_io_) cudaFreeHost(host_io_);
   if (cs_) cudaStreamSynchronize(cs_), cudaStreamDestroy(cs_);
+  for (char* m : slot_mem_)
+    if (m) cudaFreeHost(m);
   for (auto e : {stage_ev_, stage_in_ev_})
     if (e) cudaEventDestroy(e);
   for (auto* m : {&prof_.eager, &prof_.graph})
@@ -507,6 +542,17 @@ bool Model::evict_checkpoint() {
   return true;
 }
 
+int Model::grow_state_cache(int n) {
+  int added = 0;
+  for (size_t i = 0; i < slot_mem_.size() && added < n; i++)
+    if (!slot_mem_[i]) {
+      Q27_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&slot_mem_[i]), ckpt_bytes_,
+                             cudaHostAllocMapped | cudaHostAllocPortable));
+      added++;
+    }
+  return added;
+}
+
 void Model::save_checkpoint(bool ring) {
   if (!cache_on_ || pos_ == 0) return;
   Q27_CHECK(int(seq_ids_.size()) == pos_, "checkpoint: token history does not match the position");
@@ -522,10 +568,14 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
       c.last_use = ++use_clock_;
       return;
     }
+  // A free allocated slot; else allocate another one; else evict the least recently used checkpoint.
   int slot = -1;
-  while ((slot = int(std::find(slot_used_.begin(), slot_used_.end(), false) - slot_used_.begin())) ==
-         int(slot_used_.size()))
-    evict_checkpoint();
+  for (;;) {
+    for (size_t i = 0; i < slot_used_.size() && slot < 0; i++)
+      if (slot_mem_[i] && !slot_used_[i]) slot = int(i);
+    if (slot >= 0) break;
+    if (!grow_state_cache(1) && !evict_checkpoint()) fail("checkpoint: no state slot");
+  }
   Checkpoint ck;
   ck.ids = ids;
   ck.pages.assign(pages.begin(), pages.begin() + ceil_div(pos, kPageTokens));
@@ -542,7 +592,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
     for (const Region& r : seq_regions(stage_)) Q27_CUDA(cudaMemcpyAsync(r.area, r.dev, r.bytes, cudaMemcpyDeviceToDevice, s_));
   Q27_CUDA(cudaEventRecord(stage_in_ev_, s_));
   Q27_CUDA(cudaStreamWaitEvent(cs_, stage_in_ev_));
-  Q27_CUDA(cudaMemcpyAsync(host_slots_ + size_t(slot) * ckpt_bytes_, stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
+  Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   ckpts_.push_back(std::move(ck));
   cstats_.saved++;
@@ -564,7 +614,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     const_cast<Checkpoint*>(best)->last_use = ++use_clock_;
     // The state from its host slot (after its device -> host copy), before anything can evict it.
     Q27_CUDA(cudaStreamSynchronize(cs_));
-    const char* src = host_slots_ + size_t(best->slot) * ckpt_bytes_;
+    const char* src = slot_mem_[best->slot];
     Q27_CUDA(cudaMemcpyAsync(ssm_, src, ssm_bytes_, cudaMemcpyHostToDevice, s_));
     Q27_CUDA(cudaMemcpyAsync(conv_, src + ssm_bytes_, conv_bytes_, cudaMemcpyHostToDevice, s_));
     if (draft_) {
@@ -638,6 +688,25 @@ void Model::cache_stats(int64_t* out) const {
   for (const auto& c : ckpts_)
     for (int32_t p : c.pages) ckpt_only += ++n[p] == pool_.refs(p);
   out[8] = ckpt_only, out[9] = pool_.pages() - 1, out[10] = park_pages_;
+  out[11] = int64_t(std::count_if(slot_mem_.begin(), slot_mem_.end(), [](char* m) { return m != nullptr; }));
+}
+
+std::string Model::memory_report() const {
+  std::string out;
+  for (const Pool* p : {&dev_weights_, &host_weights_, &kv_, &state_, &act_, &host_cache_, &host_mm_}) {
+    out += "pool\t" + p->name() + "\t" + (p->host() ? "1" : "0") + "\t" + std::to_string(p->size()) + "\n";
+    for (const auto& [what, bytes] : p->items())
+      out += "item\t" + p->name() + "\t" + what + "\t" + std::to_string(bytes) + "\n";
+  }
+  out += "slots\t" + std::to_string(slot_used_.size()) + "\t" + std::to_string(ckpt_bytes_) + "\n";
+  return out;
+}
+
+void Model::device_memory(int64_t* out) const {
+  size_t free = vram_.free_at_start, total = vram_.total;
+  if (!opt_.plan_only) Q27_CUDA(cudaMemGetInfo(&free, &total));
+  out[0] = int64_t(free), out[1] = int64_t(total), out[2] = int64_t(vram_.free_at_start);
+  out[3] = int64_t(vram_.budget);
 }
 
 int Model::prefill_cut(int T, bool last) const {
@@ -653,9 +722,10 @@ int Model::prefill_cut(int T, bool last) const {
 
 
 namespace {
-// Debug (Q27_SKINNY_CHECK=1): runs `cutlass` into a scratch buffer next to `skinny` and logs the difference.
+// Debug (Q27_SKINNY_CHECK=1): runs `many` (the many-row GEMM) into a scratch buffer next to `skinny` and logs the
+// difference.
 template <class FC, class FS>
-void check_skinny(const char* what, int T, int N, float* out, bool residual, cudaStream_t s, FC cutlass, FS skinny) {
+void check_skinny(const char* what, int T, int N, float* out, bool residual, cudaStream_t s, FC many, FS skinny) {
   static float *c0 = nullptr, *c1 = nullptr;
   if (!c0) {
     Q27_CUDA(cudaMalloc(&c0, size_t(8) * 248320 * 4));
@@ -663,7 +733,7 @@ void check_skinny(const char* what, int T, int N, float* out, bool residual, cud
   }
   size_t n = size_t(T) * N;
   Q27_CUDA(cudaMemcpyAsync(c0, out, n * 4, cudaMemcpyDeviceToDevice, s));
-  cutlass(residual ? c0 : nullptr, c1);
+  many(residual ? c0 : nullptr, c1);
   skinny();
   std::vector<float> a(n), b(n);
   Q27_CUDA(cudaMemcpyAsync(a.data(), c1, n * 4, cudaMemcpyDeviceToHost, s));
@@ -695,8 +765,16 @@ bool Model::skip(const char* kind) const {
 
 QuantOut Model::q8(float in_scale) const { return {QuantOut::kFp8, in_scale, aq_, nullptr}; }
 QuantOut Model::q4(float in_scale) const { return {QuantOut::kFp4, in_scale, aq_, asf_}; }
+QuantOut Model::q8row() const { return {QuantOut::kFp8Row, 1.f, aq_, nullptr, ascale_}; }
 
+// The input of an NVFP4 or per-token FP8 projection from fp32 rows (an FP8 one with a calibrated input scale was
+// quantized by the op that wrote x).
 void Model::quant_in(const LinearQ& l, const float* x, int T, int K) {
+  if (l.dyn) {
+    mark("quant fp8 rows");
+    quant_fp8_rows(x, K, T, K, aq_, ascale_, s_);
+    return;
+  }
   if (!l.fp4) return;
   mark("quant fp4");
   quant_fp4(x, T, K, l.in_scale(), aq_, asf_, s_);
@@ -709,18 +787,34 @@ void Model::gemm_q(const char* what, const LinearFp8& l, int T, float* out, bool
   if (skip("gemm") || skip("gemm8")) return;
   const float* c = residual ? out : nullptr;
   const float beta = residual ? 1.f : 0.f;
+  if (l.w_scales) {  // per-channel weight scales, per-token activation scales (ascale_)
+    if (T <= kSkinnyMaxM && skinny_) {
+      auto run = [&] {
+        skinny_fp8_scaled(T, l.out, l.in, aq_, ascale_, l.w, l.w_scales, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_);
+      };
+      if (skinny_check_)
+        check_skinny(what, T, l.out, out, residual, s_, [&](const float* cc, float* d) {
+          gemm_fp8_scaled(T, l.out, l.in, aq_, ascale_, l.w, l.w_scales, cc, cc ? 1.f : 0.f, d, s_);
+        }, run);
+      else
+        run();
+      return;
+    }
+    gemm_fp8_scaled(T, l.out, l.in, aq_, ascale_, l.w, l.w_scales, c, beta, out, s_);
+    return;
+  }
   if (T <= kSkinnyMaxM && skinny_) {
     auto run = [&] { skinny_fp8(T, l.out, l.in, aq_, l.w, l.alpha, c, beta, out, skinny_ws_, kSkinnyWsBytes, s_); };
     if (skinny_check_ && l.alpha.count == 1)
       check_skinny(what, T, l.out, out, residual, s_, [&](const float* cc, float* d) {
-        gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, ws_, ws_bytes_, s_);
+        gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, s_);
       }, run);
     else
       run();
     return;
   }
   Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");
-  gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], c, beta, out, ws_, ws_bytes_, s_);
+  gemm_fp8(T, l.out, l.in, aq_, l.w, l.alpha.alpha[0], c, beta, out, s_);
 }
 
 void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool residual) {
@@ -734,19 +828,19 @@ void Model::gemm_q(const char* what, const LinearFp4& l, int T, float* out, bool
     };
     if (skinny_check_ && l.alpha.count == 1)
       check_skinny(what, T, l.out, out, residual, s_, [&](const float* cc, float* d) {
-        gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, ws_, ws_bytes_, s_);
+        gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], cc, cc ? 1.f : 0.f, d, s_);
       }, run);
     else
       run();
     return;
   }
   Q27_CHECK(l.alpha.count == 1, std::string(what) + ": fused projections need the skinny path");
-  gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], c, beta, out, ws_, ws_bytes_, s_);
+  gemm_fp4(T, l.out, l.in, aq_, asf_, l.w, l.sf, l.alpha.alpha[0], c, beta, out, s_);
 }
 
 // Up to 8 tokens (decode, speculative verify) run the fused projections (qkv|z, q|k|v, gate|up) on the
 // skinny path; their outputs are rows of the concatenation, so the parts are offsets with the fused
-// row stride. Larger chunks run the projections separately (CUTLASS).
+// row stride. Larger chunks run the projections separately (the many-row GEMMs).
 // Fused projections (strided outputs: decode-style attention). A batched verify (up to 64 rows, Phase 7)
 // takes them too: its rows must run the GEMMs of a single sequence's verify (another shape splits K
 // differently).
@@ -807,7 +901,7 @@ void Model::gdn(int i, int T) {
     if (!skip("gdn")) gdn_verify_prep(qkv, ld, Tv, conv, G.conv, h_, G.a, G.b, q_, sp, s_);
     mark("gdn recurrent+norm");
     if (!skip("gdn"))
-      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, n_, G.out.fp4 ? nullptr : aq_,
+      gdn_verify(q_, Tv, G.A_log, G.dt_bias, ssm, z, ldz, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
                  G.out.in_scale(), sp, s_);
     quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
@@ -818,7 +912,7 @@ void Model::gdn(int i, int T) {
     if (!skip("gdn")) gdn_decode_prep(qkv, conv, G.conv, h_, G.a, G.b, q_, k_, v_, a_, b_, s_);
     mark("gdn recurrent+norm");
     if (!skip("gdn"))
-      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, n_, G.out.fp4 ? nullptr : aq_,
+      gdn_decode(q_, k_, v_, a_, b_, G.A_log, G.dt_bias, ssm, z, G.norm, kEps, n_, G.out.static8() ? aq_ : nullptr,
                  G.out.in_scale(), s_);
     quant_in(G.out, n_, T, kVHeads * kVDim);
     gemm_q("gdn out", G.out, T, x_, true);
@@ -836,7 +930,7 @@ void Model::gdn(int i, int T) {
   else
     gdn_recurrent(q_, k_, v_, g_, beta_, T, ssm, o_, s_);
   mark("gdn gated norm");
-  if (G.out.fp4) {  // fp32 in place, then NVFP4
+  if (!G.out.static8()) {  // fp32 in place, then NVFP4 / FP8 per token
     gdn_gated_norm(o_, z, ldz, G.norm, T, kEps, o_, s_);
     quant_in(G.out, o_, T, kVHeads * kVDim);
   } else {
@@ -871,7 +965,7 @@ void Model::attn(int i, int T) {
     mark("attn core");
     if (!skip("attn"))
       attention_decode_lanes(v_, qg, ldq, bsl_, kv, opt_.kv_type, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                             A.o.fp4 ? nullptr : aq_, A.o.in_scale());
+                             A.o.static8() ? aq_ : nullptr, A.o.in_scale());
     quant_in(A.o, o_, T, kHeads * kHeadDim);
     gemm_q("attn o", A.o, T, x_, true);
     return;
@@ -885,7 +979,7 @@ void Model::attn(int i, int T) {
   if (skip("attn")) {
   } else if (T <= kDecodeMaxT) {
     attention_decode(v_, qg, ldq, T, pos_dev_, kv, opt_.kv_type, page_table_, o_, attn_ws_, kAttnDecodeWsBytes, s_,
-                     A.o.fp4 ? nullptr : aq_, A.o.in_scale(), tree);
+                     A.o.static8() ? aq_ : nullptr, A.o.in_scale(), tree);
     quant_in(A.o, o_, T, kHeads * kHeadDim);
   } else {
     Q27_CHECK(ldq == kHeads * 2 * kHeadDim, "attention: unexpected q stride");
@@ -893,7 +987,7 @@ void Model::attn(int i, int T) {
     attention(v_, qg, T, pos_, kv, opt_.kv_type, page_table_, o_, big2_, size_t(opt_.prefill_chunk) * kInter * 4, s_,
               fa_stage_, fa_stage_bytes_);
     mark("quant fp8");
-    if (A.o.fp4)
+    if (!A.o.static8())
       quant_in(A.o, o_, T, kHeads * kHeadDim);
     else
       quant_fp8(o_, int64_t(T) * kHeads * kHeadDim, A.o.in_scale(), aq_, s_);
@@ -903,33 +997,68 @@ void Model::attn(int i, int T) {
 
 void Model::mlp(int i, int T) {
   const auto& L = w_.layers[i];
+  if (L.mlp8) {
+    mlp_fp8(L, T);
+    return;
+  }
   mark("norm+quant");
   if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q4(L.gate.in_scale), s_);
-  float *gate = big1_, *up = big2_;
-  int64_t ld = kInter;
-  if (fused(T)) {
-    gemm_q("mlp gate_up", L.gate_up, T, big1_, false);
-    up = big1_ + kInter;
-    ld = 2 * kInter;
-  } else if (mlp_bf16_ && T > kSkinnyMaxM) {
-    // Prefill: gate / up in BF16 (they only feed silu * up and its FP4 quantization).
-    bf16 *gb = reinterpret_cast<bf16*>(big1_), *ub = reinterpret_cast<bf16*>(big2_);
-    for (auto [what, l, d] : {std::tuple{"mlp gate", &L.gate, gb}, std::tuple{"mlp up", &L.up, ub}}) {
-      mark(what);
-      if (!skip("gemm") && !skip("gemm4"))
-        gemm_fp4_bf16(T, l->out, l->in, aq_, asf_, l->w, l->sf, l->alpha.alpha[0], d, ws_, ws_bytes_, s_);
-    }
-    mark("mlp silu+quant");
-    if (!skip("silu")) silu_mul_quant_fp4(gb, ub, kInter, T, kInter, L.down.in_scale, aq_, asf_, s_);
-    gemm_q("mlp down", L.down, T, x_, true);
+  // gate_up is the interleaved gate | up with alpha 1 (Weights::fp4_glu): the silu step reads it as such and
+  // applies the gate's and the up's alphas.
+  const float ag = L.gate.alpha.alpha[0], au = L.up.alpha.alpha[0];
+  if (mlp_fused_ && T > kSkinnyMaxM && !fused(T)) {
+    // Prefill: one GEMM for gate | up whose epilogue writes silu(gate) * up as the down GEMM's NVFP4
+    // activations (big1_ / big2_: aq_ is this GEMM's input), instead of BF16 gate / up written and read
+    // back.
+    auto* q = reinterpret_cast<uint8_t*>(big1_);
+    auto* qsf = reinterpret_cast<uint8_t*>(big2_);
+    mark("mlp gate_up+silu");
+    if (!skip("gemm") && !skip("gemm4"))
+      gemm_fp4_glu(T, kInter, kHidden, aq_, asf_, L.gate_up.w, L.gate_up.sf, ag, au, L.down.in_scale, q, qsf, s_);
+    mark("mlp down");
+    if (!skip("gemm") && !skip("gemm4"))
+      gemm_fp4(T, kHidden, kInter, q, qsf, L.down.w, L.down.sf, L.down.alpha.alpha[0], x_, 1.f, x_, s_);
     return;
+  }
+  if (mlp_bf16_ && T > kSkinnyMaxM && !fused(T)) {
+    // Prefill: gate | up in BF16 (it only feeds silu * up and its FP4 quantization; [T][2 I] in big1_).
+    bf16* gu = reinterpret_cast<bf16*>(big1_);
+    mark("mlp gate_up");
+    if (!skip("gemm") && !skip("gemm4"))
+      gemm_fp4_bf16(T, L.gate_up.out, L.gate_up.in, aq_, asf_, L.gate_up.w, L.gate_up.sf, 1.f, gu, s_);
+    mark("mlp silu+quant");
+    if (!skip("silu")) silu_mul_quant_fp4_glu(gu, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
   } else {
-    gemm_q("mlp gate", L.gate, T, big1_, false);
-    gemm_q("mlp up", L.up, T, big2_, false);
+    // fp32 [T][2 I]: in big1_ ([Tc][I]) up to Tc / 2 rows, beyond that also in big2_ (adjacent).
+    Q27_CHECK(2 * T <= opt_.prefill_chunk || big2_ == big1_ + size_t(opt_.prefill_chunk) * kInter,
+              "MLP: big1_ / big2_ not adjacent");
+    gemm_q("mlp gate_up", L.gate_up, T, big1_, false);
+    mark("mlp silu+quant");
+    if (!skip("silu")) silu_mul_quant_fp4_glu(big1_, T, kInter, ag, au, L.down.in_scale, aq_, asf_, s_);
+  }
+  gemm_q("mlp down", L.down, T, x_, true);
+}
+
+// An FP8 MLP (per-channel weight scales, activations quantized per token): gate | up as one GEMM on the skinny path
+// (fp32 [T][2 I] in big1_, as the NVFP4 MLP's), gate and up apart into big1_ / big2_ otherwise; silu(gate) * up
+// quantized per token for the down GEMM.
+void Model::mlp_fp8(const LayerWeights& L, int T) {
+  mark("norm+quant");
+  if (!skip("norm")) rmsnorm_quant(x_, L.post_norm, T, kEps, nullptr, q8row(), s_);
+  const float *gate = big1_, *up = big2_;
+  int64_t ld = kInter;
+  if (T <= kSkinnyMaxM && skinny_) {
+    Q27_CHECK(2 * T <= opt_.prefill_chunk || big2_ == big1_ + size_t(opt_.prefill_chunk) * kInter,
+              "MLP: big1_ / big2_ not adjacent");
+    gemm_q("mlp gate_up", L.gate_up8, T, big1_, false);
+    up = big1_ + kInter, ld = 2 * kInter;
+  } else {
+    gemm_q("mlp gate", L.gate8, T, big1_, false);
+    gemm_q("mlp up", L.up8, T, big2_, false);
   }
   mark("mlp silu+quant");
-  if (!skip("silu")) silu_mul_quant_fp4(gate, up, ld, T, kInter, L.down.in_scale, aq_, asf_, s_);
-  gemm_q("mlp down", L.down, T, x_, true);
+  if (!skip("silu")) silu_mul_quant_fp8_rows(gate, up, ld, T, kInter, aq_, ascale_, s_);
+  gemm_q("mlp down", L.down8, T, x_, true);
 }
 
 void Model::chunk(const int32_t* ids_dev, int T, bool advance) {
@@ -966,7 +1095,7 @@ void Model::mm_set(const int32_t* spans, int n) {
   Q27_CUDA(cudaStreamSynchronize(s_));
 }
 
-void Model::mm_encode(int i, const float* pixels) {
+void Model::mm_encode(int i, const VisionPixels& pixels) {
   Q27_CHECK(opt_.vision && i >= 0 && i < int(mm_spans_.size()), "mm_encode: no such image");
   const MmSpan& sp = mm_spans_[i];
   const int gh = sp.gh * vdims::kMerge, gw = sp.gw * vdims::kMerge;
@@ -1034,6 +1163,11 @@ void Model::copy_hist(int32_t* dst, const int32_t* ids, int n) {
 
 void Model::logits(const float* x_rows, int rows) {
   mark("norm+quant");
+  if (w_.lm_head8.w) {  // (an FP8 lm_head: lm_head is the draft model's NVFP4 copy)
+    rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q8row(), s_);
+    gemm_q("lm_head", w_.lm_head8, rows, logits_, false);
+    return;
+  }
   rmsnorm_quant(x_rows, w_.final_norm, rows, kEps, nullptr, q4(w_.lm_head.in_scale), s_);
   gemm_q("lm_head", w_.lm_head, rows, logits_, false);
 }

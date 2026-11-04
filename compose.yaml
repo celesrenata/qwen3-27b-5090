@@ -1,9 +1,10 @@
 name: qwen3-27b-5090
 
-# Development services, and the engine served on port 8000 from the same image.
+# The engine served on port 8000 (its own small image, Dockerfile), and the development services (dev/Dockerfile).
+#   docker compose pull serve && docker compose up -d serve   # the published serving image; the OpenAI / Anthropic API on 127.0.0.1:8000
+#   docker compose up -d --build serve                    # the same, with the image built from this checkout
 #   docker compose --profile dev run --rm dev-cpu <cmd>   # no GPU attached (safe while another env is serving)
 #   docker compose --profile dev run --rm dev <cmd>       # GPU attached (microbenchmarks, GPU reference, engine tests)
-#   docker compose up -d serve                            # build libq27.so and serve the OpenAI / Anthropic API on 127.0.0.1:8000
 x-dev: &dev
   build: ./dev
   image: local/qwen3-27b-5090-dev:cuda13.3-torch2.14.1
@@ -38,14 +39,32 @@ services:
       CUDA_VISIBLE_DEVICES: ""
     profiles: [dev]
   serve:
-    <<: *dev
+    # libq27.so, the server and its three Python packages; the code is in the image (`--build` after a change).
+    # SERVE_TAG: a published version (`docker compose pull serve`), latest by default.
+    build: .
+    image: ghcr.io/mkyt/qwen3-27b-5090:${SERVE_TAG:-latest}
+    user: "${UID:-1000}:${GID:-1000}"
+    ipc: host
+    ulimits:
+      memlock: -1
+    volumes:
+      - ./hf:/hf
     gpus: all
     container_name: qwen3-27b-5090
     ports:
-      - "127.0.0.1:8000:8000"
+      # The address on the host; the server in the container always listens on 8000 (HOST=0.0.0.0: the network, and
+      # /admin has no authentication).
+      - "${HOST:-127.0.0.1}:${PORT:-8000}:8000"
     environment:
-      <<: *dev-env
       SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-qwen3.8-27b}  # same name as the vLLM / SGLang environments
+      ENGINE_AUTOSTART: ${ENGINE_AUTOSTART:-1}     # 0: the server starts with the engine stopped (no VRAM; start it at /ui)
+      MIN_KV_TOKENS: ${MIN_KV_TOKENS:-0}           # do not start if the KV pool would hold fewer tokens (0: any size)
+      VRAM_BUDGET_GIB: ${VRAM_BUDGET_GIB:-}        # empty: automatic (free memory minus WDDM_MARGIN_GIB); only lowers it
+      WDDM_MARGIN_GIB: ${WDDM_MARGIN_GIB:-0.6}     # VRAM kept free for the display driver
+      Q27_LOAD_THREADS: ${Q27_LOAD_THREADS:-8}     # threads reading the weight files ahead of the uploads
+      STATS_SAMPLE_S: ${STATS_SAMPLE_S:-1}         # seconds between the GPU samples of /ui (0: none)
+      API_DUMP_DIR: ${API_DUMP_DIR:-}              # debugging: write every POST body to this directory in the container
+      ENGINE_IDLE_UNLOAD_S: ${ENGINE_IDLE_UNLOAD_S:-0}  # seconds without a request before the engine frees its VRAM (0: off)
       MAX_TOKENS: ${MAX_TOKENS:-262144}
       MAX_TOKENS_FIT: ${MAX_TOKENS_FIT:-1}         # 1: lower MAX_TOKENS to what the VRAM fits (since P7-13 MAX_SEQS=8 fits 262144)
       MAX_SEQS: ${MAX_SEQS:-8}                     # requests the engine can run at once (fewer while the KV pool is short; more wait)
@@ -70,9 +89,7 @@ services:
       Q27_ATTN_FP8: ${Q27_ATTN_FP8:-}              # prefill attention MMAs: empty = 2 (FP8 KV) / 3 (NVFP4 KV: Q·K on FP4 MMAs, P7-8); 2 Q·K and P·V in FP8, 1 P·V only, 0 BF16
       Q27_ATTN_FP4_STAGE: ${Q27_ATTN_FP4_STAGE:-1} # NVFP4 KV prefill: V (mode 3) rounded to E4M3 once per call (P7-8; 1 KiB/token; 0 = per CTA, mode 2)
       Q27_ATTN_TC_F8: ${Q27_ATTN_TC_F8:-}          # decode / verify attention MMAs: empty = FP8 with NVFP4 KV (P7-7), 1 = also with FP8 KV, 0 = BF16 / f16
-    command: >-
-      bash -c 'cmake -S engine -B /build/engine -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-      && cmake --build /build/engine && exec python frontend/server.py'
+      Q27_MLP_FUSED: ${Q27_MLP_FUSED:-1}           # prefill MLP: 1 = gate | up, silu * up and its NVFP4 quantization in one GEMM (gemm_mma.cu); 0 = BF16 gate | up, then the silu step
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
       interval: 10s

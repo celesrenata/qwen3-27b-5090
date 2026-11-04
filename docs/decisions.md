@@ -210,7 +210,7 @@ gate without an explicit decision, recorded below with its numbers.
   most 63 extra tokens and stays bit-identical.
 - **P5-3: CUTLASS tiles unchanged.** FP4 GEMMs hold the SM clock at about 1.79 GHz at 400 W (power throttling);
   corrected for the clock they run at about 87% of the MMA peak. Of nine tile, schedule and split configurations
-  (`micro/gemm_tune.cu`), only BF16 output was faster (2 to 9%), used where the next step needs no more (the MLP's
+  (`micro/gemm_tune.cu`, removed with CUTLASS), only BF16 output was faster (2 to 9%), used where the next step needs no more (the MLP's
   gate / up, which only feed SiLU and FP4 quantization).
 - **P5-4: chunks of 2,048 tokens.** At 32K, chunks of 2,048 / 4,096 / 8,192 took 4.66 / 4.60 / 4.54 s: 2.5% for 4
   times the activation memory.
@@ -243,11 +243,49 @@ gate without an explicit decision, recorded below with its numbers.
     along the keys the MMA reduces over.
   - (C, dropped) A softmax per 64 keys (half the output rescales): -0.5 to 1.5%, within noise. Three heads per CTA
     ran out of registers.
+- **P5-12: the MLP's gate | up stored interleaved (blocks of 64 rows, gate and up in turn).** The fused prefill
+  GEMM (`gemm_fp4_glu_mma`, `Q27_MLP_FUSED=1`, the default since 2026-10-28: gate | up, then silu(gate) * up NVFP4-quantized in the epilogue)
+  needs the gate and the up rows of the same outputs in one tile. With the two stored apart, a 128-row tile took
+  half of a gate and half of an up scale atom (the NVFP4 scale layout groups 128 rows), 50% more B-scale bytes per
+  K step: the interleaved layout makes it one atom, -3.8% time and about -2% energy per call. The loader places
+  the rows (no extra memory), the GEMMs on gate | up run with alpha 1 and the SiLU step applies the gate's and the
+  up's. Decode and the fused prefill are bit-identical to before; the BF16 prefill (`Q27_MLP_FUSED=0`) now writes
+  one BF16 gate | up (KL to the previous engine 0.048, to the BF16 original unchanged). With the fused path, prefill
+  at 19K / 73K is 2.2 / 1.7% faster and uses 2.1% less energy per token than the BF16 path. Quality against it:
+  GSM8K 95.3 / 95.3%, BFCL 88.9 / 89.1%, Japanese reference scores within their CIs (JSQuAD F1 +1.6), needles at
+  256K 56 / 58 of 64, KL to the BF16 original 0.0470 / 0.0454.
+- **P5-12: own GEMMs for every many-row GEMM; CUTLASS optional.** `gemm_mma.cu` now also runs E4M3 (the block-scaled
+  MMA with unit scales) and BF16 (the draft's context, vision; any N and K through TMA's edge handling) with the same
+  tiles and epilogue: the m16n8k32 E4M3 and m16n8k16 BF16 fragments hold the same bytes per K step as the NVFP4 k64
+  ones. Results are bit-identical to CUTLASS. CUTLASS (SM120 3.x and the 2.x BF16 kernel) is built with
+  `-DQ27_CUTLASS_GEMM=ON` (default; off for MSVC, which cannot compile CuTe) and chosen per call with
+  `Q27_GEMM_CUTLASS` (default 1 in such builds). At 400 W the own E4M3 GEMM is 1.5-5.6% faster than CUTLASS's MXFP8
+  one; the own NVFP4 and BF16 GEMMs are 1-3% slower: same L2 traffic and active cycles at a fixed clock, but more
+  power per cycle, so a lower clock at the power limit. Two changes closed part of the gap: a suspend-time hint on
+  the mbarrier waits (as CUTLASS's; spinning waits were ~20% of the instructions) and a 2 KiB epilogue staging per
+  warp (one more ring stage). The fused MLP GEMM's epilogue dropped denormal handling it never needs (ftz exp2 and
+  reciprocal, a branch-free division by 6; bit-identical): -28% of its instructions, -0.9% time.
+  Later the rest of the gap was found in the K loop's integer instructions: the stage addresses and barrier phases ran
+  on the vector datapath (~30 instructions per 32 MMAs), CUTLASS's on the uniform one. With the warp index made
+  warp-uniform (`__shfl_sync`, as CUTLASS's `canonical_warp_idx_sync`), the empty-barrier arrive predicated instead of
+  branched and only the per-lane offsets kept opaque to the compiler, the loop has no vector integer arithmetic left
+  and the NVFP4 GEMMs lost 1.5-2% of their energy. The tile order then mattered by 2-5%: N fastest (the CTAs running
+  at the same time share activation rows) beats M fastest except where the weights do not stay in L2 between the
+  passes (the fused gate | up, 89 MB: M fastest there). At 400 W, against CUTLASS: NVFP4 gdn qkv / out / down -2.5 to
+  -3.6%, gdn z +1.8%; E4M3 -4.3 to -7%; BF16 +0.5-1.1%; the fused MLP GEMM -3% against its previous version.
+  Prefill with all own kernels: +0.6% / +0.0% at 19K / 73K.
+- **P5-12: CUTLASS removed.** With the own GEMMs as fast as CUTLASS's in the prefill and bit-identical, `gemm.cu`,
+  `gemm_bf16.cu`, the CMake option, the GEMM workspace, `Q27_GEMM_CUTLASS` / `Q27_GEMM_MXFP8` and CUTLASS in both
+  images went; the engine builds with the CUDA toolkit alone (a precondition for MSVC, which cannot compile CuTe).
+  Last tries on gdn z (N 6,144, the one shape still 1.8-2.7% slower; identical at a fixed clock, time, L2 bytes and
+  instructions alike): one GEMM for qkv | z (slower than the two), as many tiles on every CTA (154 x 5), a dynamic
+  tile counter, the producer's loads from an elected lane without the per-lane loop the lane-0 branch compiled to
+  (14% of the instructions: kept, but no faster). As a pair qkv and z are 1.7% faster than CUTLASS's.
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision
 
-- **P4-12: the vision tower** (`VISION=off / host / fp8 / bf16`): the ViT on BF16 CUTLASS GEMMs with FP32
+- **P4-12: the vision tower** (`VISION=off / host / fp8 / bf16`): the ViT on BF16 GEMMs (CUTLASS's until P5-12) with FP32
   residuals and LayerNorm, a non-causal flash attention per image (head dimension 72 padded to 80 in shared
   memory), M-RoPE. One image per call, so no variable-length attention is needed. Its workspace (305 MiB for a
   4,096-token image) reuses the prefill activations.

@@ -4,6 +4,8 @@
 /cache/
 # `nix build .#x` output symlink (recreated on each build)
 result
+/engine/build/
+/windows/tray/build/
 __pycache__/
 .pytest_cache/
 # Golden recordings (scripts/download-golden.sh, GitHub Releases) and downloaded evaluation data
@@ -14,3 +16,4 @@ __pycache__/
 # Local compose additions and settings (a private checkout may link its own here)
 compose.override.yaml
 .env
+/dist/

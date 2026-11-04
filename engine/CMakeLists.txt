@@ -10,19 +10,32 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo --expt-relaxed-constexpr")
+if(MSVC)
+  # CCCL needs the conforming preprocessor; the CUDA headers are UTF-8 (cl defaults to the ANSI code page).
+  set(Q27_MSVC_FLAGS /utf-8 /Zc:preprocessor /Zc:__cplusplus /D_CRT_SECURE_NO_WARNINGS)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${Q27_MSVC_FLAGS}>")
+  string(REPLACE ";" "," Q27_MSVC_FLAGS_CSV "${Q27_MSVC_FLAGS}")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${Q27_MSVC_FLAGS_CSV}>")
+  # The C ABI in capi.cc carries no export annotations; export everything from q27.dll.
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  # Hybrid CRT: the C++ runtime (vcruntime, msvcp) linked statically and the Universal CRT from the system's
+  # ucrtbase.dll, so q27.dll needs no VC++ redistributable and shares the heap and the environment with Python
+  # (a static UCRT would keep its own copy of the environment, blind to os.environ set after the load).
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  set(Q27_UCRT "ucrt$<$<CONFIG:Debug>:d>.lib")
+endif()
 
-set(CUTLASS_DIR $ENV{CUTLASS_DIR} CACHE PATH "CUTLASS checkout")
 find_package(CUDAToolkit REQUIRED)
 
 # One shared library with a C ABI: used by the Python frontend and by the kernel tests (ctypes).
 add_library(q27 SHARED
   src/json.cc
   src/safetensors.cc
+  src/prefetch.cc
   src/memory.cc
   src/weights.cc
   src/kernels.cu
-  src/gemm.cu
-  src/gemm_bf16.cu
+  src/gemm_mma.cu
   src/skinny.cu
   src/gdn.cu
   src/attention.cu
@@ -33,14 +46,11 @@ add_library(q27 SHARED
   src/model.cc
   src/capi.cc
 )
-target_include_directories(q27 PRIVATE src ${CUTLASS_DIR}/include ${CUTLASS_DIR}/tools/util/include)
+target_include_directories(q27 PRIVATE src)
 target_link_libraries(q27 PRIVATE CUDA::cudart)
-# CUTLASS kernels need the relaxed constexpr flag and generate a lot of template code.
-set_source_files_properties(src/gemm.cu PROPERTIES COMPILE_OPTIONS "-DCUTLASS_ENABLE_GDC_FOR_SM100=0")
+if(MSVC)
+  target_link_options(q27 PRIVATE "/NODEFAULTLIB:lib${Q27_UCRT}" "/DEFAULTLIB:${Q27_UCRT}")
+endif()
 
-add_executable(q27-sfcheck tools/sfcheck.cu)
-target_link_libraries(q27-sfcheck PRIVATE CUDA::cudart)
-target_include_directories(q27-sfcheck PRIVATE src ${CUTLASS_DIR}/include)
-
+# Used by the nix build in flake.nix (installPhase runs cmake --install).
 install(TARGETS q27 DESTINATION lib)
-install(TARGETS q27-sfcheck DESTINATION bin)

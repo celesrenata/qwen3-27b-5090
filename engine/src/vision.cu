@@ -1,7 +1,7 @@
 // Vision tower (P4-12, see vision.h and reference/qwen27b/vision.py).
 //
 // Per image of P patches: patch embed (a GEMM on the flattened patches) + the bilinearly resampled position
-// table, 27 pre-LN blocks, the 2x2 merger. GEMMs are gemm_bf16 (CUTLASS, fp32 out); rows are processed in
+// table, 27 pre-LN blocks, the 2x2 merger. GEMMs are gemm_bf16 (fp32 out); rows are processed in
 // chunks of kRows where a GEMM needs a wide temporary. Attention is non-causal over the image's patches:
 // a flash-attention kernel with BF16 mma.sync, head_dim 72 padded to 80 in shared memory.
 //
@@ -79,6 +79,26 @@ __global__ void f32_to_bf16_kernel(const float* x, int64_t n, bf16* out) {
     const float4 v = *reinterpret_cast<const float4*>(x + i);
     *reinterpret_cast<__nv_bfloat162*>(out + i) = __floats2bfloat162_rn(v.x, v.y);
     *reinterpret_cast<__nv_bfloat162*>(out + i + 2) = __floats2bfloat162_rn(v.z, v.w);
+  }
+}
+
+struct PixelNorm {
+  float mean[3], std[3];
+};
+
+// BF16 patches [n / 1536][1536] from the rgb rows of a band of merge rows that starts with patch p0: element
+// (c, t, y, x) of patch p is pixel (16 * row + y - y0, 16 * col + x) of channel c, (v - mean) / std rounded as
+// the processor's fp32 (no contraction: a subtraction and a division, both round-to-nearest).
+__global__ void rgb_patches_kernel(const uint8_t* rgb, int width, int gw, int64_t p0, int y0, int64_t n, PixelNorm nm,
+                                   bf16* out) {
+  constexpr int kPP = kPatchPixels * kPatchPixels, kPerChannel = kPatchDim / 3;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x) {
+    const int e = int(i % kPatchDim), c = e / kPerChannel, q = e % kPP;
+    int row, col;
+    patch_rc(int(p0 + i / kPatchDim), gw, row, col);
+    const int y = row * kPatchPixels + q / kPatchPixels - y0, x = col * kPatchPixels + q % kPatchPixels;
+    const float v = float(rgb[(int64_t(y) * width + x) * 3 + c]);
+    out[i] = __float2bfloat16_rn(__fdiv_rn(__fsub_rn(v, nm.mean[c]), nm.std[c]));
   }
 }
 
@@ -433,8 +453,36 @@ void vision_quant_fp8(const bf16* w, int rows, int cols, uint8_t* q, float* scal
   Q27_CUDA(cudaGetLastError());
 }
 
-void vision_encode(const VisionWeights& W, const float* pixels, int gh, int gw, bf16* out, void* ws, size_t ws_bytes,
-                   cudaStream_t s) {
+void vision_pixels(const VisionPixels& px, int gh, int gw, bf16* out, void* tmp, size_t tmp_bytes, cudaStream_t s) {
+  const int64_t P = int64_t(gh) * gw;
+  if (px.patches) {  // (host fp32 -> BF16, in chunks)
+    const int64_t per = int64_t(tmp_bytes / 4 / kPatchDim);  // patches per chunk
+    for (int64_t p0 = 0; p0 < P; p0 += per) {
+      const int64_t n = std::min<int64_t>(per, P - p0) * kPatchDim;
+      Q27_CUDA(cudaMemcpyAsync(tmp, px.patches + p0 * kPatchDim, n * 4, cudaMemcpyHostToDevice, s));
+      f32_to_bf16_kernel<<<grid_for(n / 4), 256, 0, s>>>(static_cast<float*>(tmp), n, out + p0 * kPatchDim);
+    }
+  } else {  // (host uint8 RGB -> BF16 patches, in bands of whole merge rows: their patches are consecutive)
+    Q27_CHECK(px.rgb, "vision: no pixels");
+    PixelNorm nm;
+    for (int c = 0; c < 3; c++) nm.mean[c] = px.mean[c], nm.std[c] = px.std[c];
+    const int width = gw * kPatchPixels, band_rows = kMerge * kPatchPixels;
+    const int64_t band_bytes = int64_t(band_rows) * width * 3;
+    const int bands = int(std::min<int64_t>(int64_t(tmp_bytes) / band_bytes, gh / kMerge));
+    Q27_CHECK(bands > 0, "vision: image wider than the staging buffer");
+    for (int b0 = 0; b0 < gh / kMerge; b0 += bands) {
+      const int nb = std::min(bands, gh / kMerge - b0);
+      const int64_t p0 = int64_t(b0) * kMerge * gw, n = int64_t(nb) * kMerge * gw * kPatchDim;
+      Q27_CUDA(cudaMemcpyAsync(tmp, px.rgb + b0 * band_bytes, nb * band_bytes, cudaMemcpyHostToDevice, s));
+      rgb_patches_kernel<<<grid_for(n), 256, 0, s>>>(static_cast<const uint8_t*>(tmp), width, gw, p0, b0 * band_rows,
+                                                     n, nm, out + p0 * kPatchDim);
+    }
+  }
+  Q27_CUDA(cudaGetLastError());
+}
+
+void vision_encode(const VisionWeights& W, const VisionPixels& pixels, int gh, int gw, bf16* out, void* ws,
+                   size_t ws_bytes, cudaStream_t s) {
   Q27_CHECK(gh > 0 && gw > 0 && gh % kMerge == 0 && gw % kMerge == 0, "vision: the patch grid must be even");
   const int P = gh * gw;
   const Ws w = carve(ws, P, W.mode);
@@ -446,14 +494,9 @@ void vision_encode(const VisionWeights& W, const float* pixels, int gh, int gw, 
   }
 
   Stager st(W, w, s);  // (the first two stages start copying now)
-  // Pixels (host fp32) -> BF16 in heads, through tmp in chunks.
+  // Pixels -> BF16 in heads, through tmp.
   bf16* px = w.heads;
-  const int64_t per = int64_t(kRows) * kMergedDim / kPatchDim;  // patches per staging chunk
-  for (int64_t p0 = 0; p0 < P; p0 += per) {
-    const int64_t n = std::min<int64_t>(per, P - p0) * kPatchDim;
-    Q27_CUDA(cudaMemcpyAsync(w.tmp, pixels + p0 * kPatchDim, n * 4, cudaMemcpyHostToDevice, s));
-    f32_to_bf16_kernel<<<grid_for(n / 4), 256, 0, s>>>(w.tmp, n, px + p0 * kPatchDim);
-  }
+  vision_pixels(pixels, gh, gw, px, w.tmp, size_t(kRows) * kMergedDim * 4, s);
   gemm_bf16(P, kHidden, kPatchDim, px, st.get(0, 0), 1.f, nullptr, 0.f, w.x, s);
   st.done(0);
   pos_embed_kernel<<<P, 256, 0, s>>>(w.x, W.patch_b, W.pos, gh, gw);

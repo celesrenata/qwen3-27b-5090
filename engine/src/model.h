@@ -42,6 +42,12 @@ struct Options {
   // Lower max_tokens to what the VRAM budget leaves for the KV pool (rounded down to 1,024) instead of
   // failing (MAX_TOKENS_FIT; the server sets it). Not with kv_pool_tokens.
   bool fit_max_tokens = false;
+  // Fail instead of starting with a KV pool of fewer tokens (MIN_KV_TOKENS; 0: any size).
+  int min_kv_tokens = 0;
+  // Plan only (q27_plan): size the pools for a device with plan_free of plan_total bytes free and stop there, with
+  // no CUDA call (nothing allocated or loaded; memory_report, max_tokens, cache_stats and device_memory answer).
+  bool plan_only = false;
+  size_t plan_free = 0, plan_total = 0;
 };
 
 class Model {
@@ -93,9 +99,18 @@ class Model {
   int prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec);
   // Saves a checkpoint of the sequence so far (e.g. at the end of a generation).
   void checkpoint();
-  // out[11]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
-  // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area.
+  // out[12]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
+  // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area, state
+  // slots allocated.
   void cache_stats(int64_t* out) const;
+  // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
+  // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
+  int grow_state_cache(int n);
+  // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
+  // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
+  // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
+  std::string memory_report() const;
+  void device_memory(int64_t* out) const;
 
   // Prompt chunks before forward_sample / spec_begin (Phase 6: other sequences can run between them).
   // ids[0..n) is the rest of the prompt after the sequence's position; runs chunks while more than one
@@ -133,10 +148,11 @@ class Model {
   // frontend derives them from the image, so the prefix cache tells images apart) at positions
   // start .. start + gh * gw - 1, gh x gw the merged grid. mm_set (after reset / prefix_begin, before the
   // forward call) gives the request's images: spans [n][3] = (start, gh, gw), ascending. mm_encode runs
-  // the vision tower on image i (pixels [4 * gh * gw][1536] fp32, host) into its embedding rows; images
-  // whose positions the restored prefix covers need no encoding. mm_embeds copies them out (tests).
+  // the vision tower on image i (its pixels in host memory: VisionPixels, 2 gh x 2 gw patches) into its
+  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_embeds copies them
+  // out (tests).
   void mm_set(const int32_t* spans, int n);
-  void mm_encode(int i, const float* pixels);
+  void mm_encode(int i, const VisionPixels& pixels);
   void mm_embeds(int i, bf16* out);
   void mm_put(int i, const bf16* in);  // replaces image i's embeddings (tests: another vision tower)
   bool has_vision() const { return opt_.vision != 0; }
@@ -182,10 +198,12 @@ class Model {
   }
   QuantOut q8(float in_scale) const;  // quantize into aq_
   QuantOut q4(float in_scale) const;  // quantize into aq_ / asf_
-  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : q8(l.in_scale()); }
+  QuantOut q8row() const;             // quantize into aq_ per token, the row scales into ascale_
+  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : l.dyn ? q8row() : q8(l.in_scale()); }
   // The input of a projection from its fp32 rows x [T][K] (FP8 projections: the producing kernel already
   // wrote aq_; NVFP4 ones quantize here).
   void quant_in(const LinearQ& l, const float* x, int T, int K);
+  void mlp_fp8(const LayerWeights& L, int T);
   void mark(const char* label);  // start of an op (profiling only)
   void profile_collect(bool graph = false);  // after a step (graph: the replayed marks)
 
@@ -203,8 +221,12 @@ class Model {
   Options opt_;
   std::unique_ptr<SafeTensors> ckpt_;
   std::unique_ptr<SafeTensors> lm_ckpt_;  // Q27_LM_HEAD_CKPT: the NVFP4 lm_head of a BF16-lm_head model
+  Budget vram_;                      // the VRAM budget (make_budget), for device_memory
   Pool dev_weights_{"weights"}, host_weights_{"embedding", true}, kv_{"kv"}, state_{"state"}, act_{"activations"},
       host_cache_{"state cache", true}, host_mm_{"image embeddings", true};
+  // Load-time scratch placed in the KV pool (unused until the first request): the NVFP4 copy of an FP8 lm_head that
+  // the draft model only gathers its vocabulary head from.
+  Pool load_tmp_{"load-time scratch"};
   Weights w_;
   cudaStream_t s_ = nullptr;
   int pos_ = 0;
@@ -239,7 +261,7 @@ class Model {
   bool cache_on_ = false;
   std::vector<Checkpoint> ckpts_;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring
-  char* host_slots_ = nullptr;       // pinned [slots][ckpt_bytes_] (host_cache_)
+  std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
@@ -337,22 +359,22 @@ class Model {
   float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *o_ = nullptr, *n_ = nullptr;
   float *a_ = nullptr, *b_ = nullptr, *g_ = nullptr, *beta_ = nullptr;
   uint8_t *aq_ = nullptr, *asf_ = nullptr;
+  float* ascale_ = nullptr;  // per-token scales of aq_ (FP8 layers with per-channel scales: Weights::dyn8)
   int32_t* ids_ = nullptr;
   float* logits_ = nullptr;
   int32_t* topk_ids_ = nullptr;
   float* topk_logp_ = nullptr;
   float* uniform_ = nullptr;
   int32_t* sampled_ = nullptr;
-  void* ws_ = nullptr;
-  size_t ws_bytes_ = 0;
   bool mlp_bf16_ = true;                              // prefill MLP gate / up in BF16 (Q27_MLP_BF16)
+  bool mlp_fused_ = true;   // prefill MLP gate | up + silu * up + NVFP4 quantization in one GEMM (Q27_MLP_FUSED)
   static constexpr int kSkinnyMaxM = 64;              // decode and verify-sized GEMMs use skinny.cu
   static constexpr size_t kSkinnyWsBytes = 32 << 20;  // split-K partials (up to 64 rows) and counters
   void* skinny_ws_ = nullptr;
   void* attn_ws_ = nullptr;  // split-KV partials of attention_decode
   void* fa_stage_ = nullptr;  // NVFP4 KV: the context rounded to E4M3 for the prefill attention (P7-8)
   size_t fa_stage_bytes_ = 0;
-  bool skinny_ = true;         // Q27_NO_SKINNY=1: CUTLASS for every M (Phase 1 path)
+  bool skinny_ = true;         // Q27_NO_SKINNY=1: the many-row GEMMs for every M (Phase 1 path)
   bool skinny_check_ = false;
   std::string skip_;  // Q27_SKIP (debug timing)
   bool skip(const char* kind) const;

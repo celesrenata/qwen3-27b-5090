@@ -167,13 +167,36 @@ def test_bench(capsys):
             d = torch.empty(M, N, device=dev)
             ws = torch.zeros(WS, dtype=torch.uint8, device=dev)
             res = []
-            for cutlass in (0, 1):
+            for many in (0, 1):
                 us = ctypes.c_float()
-                call("q27t_bench_gemm", fp4, cutlass, M, N, K, a, asf, w, wsf, wbytes, max(sfb, 1), nbuf, 50, d, ws,
+                call("q27t_bench_gemm", fp4, many, M, N, K, a, asf, w, wsf, wbytes, max(sfb, 1), nbuf, 50, d, ws,
                      WS, ctypes.addressof(us))
                 res.append(us.value)
             gbs = (wbytes + sfb) / (res[0] * 1e-6) / 1e9
             lines.append(f"{'fp4' if fp4 else 'fp8'} M={M} N={N} K={K}: skinny {res[0]:.1f} us ({gbs:.0f} GB/s), "
-                         f"cutlass {res[1]:.1f} us")
+                         f"many-row {res[1]:.1f} us")
     with capsys.disabled():
         print("\n" + "\n".join(lines))
+
+
+@pytest.mark.parametrize("M", [1, 3, 8, 16, 31, 64])
+@pytest.mark.parametrize("N,K", SHAPES_FP8 + [(34816, 5120), (5120, 17408), (248320, 5120)])
+def test_skinny_fp8_scaled(M, N, K):
+    """Per-row activation and per-channel weight scales with a residual (the target's per-channel FP8 layers), and
+    the many-row GEMM's values up to the order of the fp32 sums."""
+    a = (torch.randn(M, K) * 30).to(torch.float8_e4m3fn)
+    b = (torch.randn(N, K) * 30).to(torch.float8_e4m3fn)
+    asc, wsc = (torch.rand(M) * 0.02 + 1e-3).to(dev), (torch.rand(N) * 1e-3 + 1e-5).to(dev)
+    ws = torch.zeros(WS, dtype=torch.uint8, device=dev)
+    prod = (a.double() @ b.double().T) * wsc.cpu().double()[None, :] * asc.cpu().double()[:, None]
+    c = torch.randn(M, N, device=dev) * prod.abs().mean().item()
+    a8, b8 = a.view(torch.uint8).to(dev), b.view(torch.uint8).to(dev)
+    for _ in range(2):  # (the split-K counters are reset)
+        d = c.clone()
+        call("q27t_skinny_fp8_scaled", M, N, K, a8, asc, b8, wsc, d, 1.0, d, ws, WS)
+        assert rel_err(d.cpu().double(), prod + c.cpu().double()) < 1e-5
+    call("q27t_skinny_fp8_scaled", M, N, K, a8, asc, b8, wsc, None, 0.0, d, ws, WS)
+    assert rel_err(d.cpu().double(), prod) < 1e-5
+    many = torch.empty_like(d)
+    call("q27t_gemm_fp8_scaled", M, N, K, a8, asc, b8, wsc, None, 0.0, many)
+    assert rel_err(d.cpu().double(), many.cpu().double()) < 5e-6  # (fp32 sums in another order)

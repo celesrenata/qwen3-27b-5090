@@ -3,7 +3,9 @@ SGLang environments (same port, model name, parsers and request options).
 
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
-/admin/concurrency (the admission settings, P7-14). Streaming everywhere (SSE), reasoning (`<think>`, returned as
+/admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
+with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
 call), images (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
 
@@ -38,6 +40,8 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import worker  # noqa: E402
+from launch import ENGINE_ENV_DEFAULTS, Launch, env_settings, model_dir, set_engine_env  # noqa: E402,F401
+from stats import HUB, request_meta  # noqa: E402
 from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
                   anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
                   parse_tool_calls, responses_messages, responses_template_kwargs, split_reasoning,
@@ -48,6 +52,8 @@ DEFAULTS = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}  # generation_config
 SPEC_MARGIN = 8  # a verify block writes up to 8 positions past the committed length
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
+UI_PAGE = ROOT / "frontend/ui/index.html"
+GENERATE = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
 
 
 def log(msg):
@@ -64,14 +70,15 @@ class ApiError(Exception):
 
 
 class Images:
-    """Image inputs (P4-12): data URLs (or http(s) URLs) -> pixel_values of the checkpoint's image processor."""
+    """Image inputs (P4-12): data URLs (or http(s) URLs) -> the image token ids and, for the engine process, the
+    encoded images with their resized size (it decodes only those it has to encode: imageproc.py)."""
 
     MAX_BYTES = 32 << 20
 
     def __init__(self, path, max_pixels):
-        from transformers import AutoImageProcessor
+        from imageproc import ImageProcessor
 
-        self.proc = AutoImageProcessor.from_pretrained(path)
+        self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
 
     @staticmethod
@@ -110,26 +117,23 @@ class Images:
         else:
             raise ApiError(400, "images must be data URLs (data:image/...;base64,...) or http(s) URLs")
         try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            with Image.open(io.BytesIO(raw)) as img:  # (the header only)
+                size = img.size
         except Exception as e:  # noqa: BLE001 - any decoder error is the client's
             raise ApiError(400, f"cannot decode image: {e}") from e
-        return raw, img
+        return raw, size
 
     def prepare(self, ids, urls, pad_id):
-        """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [pixel_values per image])."""
-        from qwen27b.vision import expand_image_pads, image_token_ids
+        """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [(encoded image, resized
+        (width, height), norm) per image] for imageproc.rgb and q27_mm_encode_rgb)."""
+        from qwen27b.image_tokens import expand_image_pads, image_token_ids
 
-        raws, imgs = zip(*(self.load(u) for u in urls))
-        batch = self.proc(images=list(imgs), size={"shortest_edge": 65536, "longest_edge": self.max_pixels},
-                          return_tensors="np")
-        grids = batch["image_grid_thw"].tolist()
+        raws, sizes = zip(*(self.load(u) for u in urls))
+        sizes = [self.proc.size(s, self.max_pixels) for s in sizes]
+        grids = [list(self.proc.grid(s)) for s in sizes]
         keys = [raw + repr((g, self.max_pixels)).encode() for raw, g in zip(raws, grids)]
         ids, spans = expand_image_pads(ids, grids, pad_id, fill=lambda i, n: image_token_ids(keys[i], n))
-        pv, out, r = batch["pixel_values"], [], 0
-        for t, h, w in grids:
-            out.append(pv[r:r + t * h * w])
-            r += t * h * w
-        return ids, [(s.start, s.gh, s.gw) for s in spans], out
+        return ids, [(s.start, s.gh, s.gw) for s in spans], [(raw, s, self.proc.norm) for raw, s in zip(raws, sizes)]
 
 
 # ---------------------------------------------------------------- the engine process
@@ -137,10 +141,18 @@ class Images:
 
 class EngineClient:
     """Starts the engine process (worker.py) and routes its messages to the requests' queues; starts a new
-    one when it dies."""
+    one when it dies. The engine holds all the VRAM: control() stops it (the server stays up and answers 503),
+    starts it again or restarts it (POST /admin/engine, the stats page). With idle_unload (seconds, 0: off) it also
+    stops after that long without a request, and the next request starts it and waits for it."""
 
-    def __init__(self, cfg):
+    LOAD_WAIT_S = 300  # how long a request waits for the engine it started (idle_unload)
+
+    def __init__(self, cfg, autostart=True, idle_unload=0.0):
         self.cfg = cfg
+        self.idle_unload = self.idle_unload_at_start = idle_unload
+        self.on_demand = None              # after an idle unload: "unloaded", then "loading" until ready (else None)
+        self.last_active = time.monotonic()
+        self.refused = None                # (time, why) of the last load that found too little VRAM (idle_unload)
         self.lock = threading.Lock()       # handles
         self.send_lock = threading.Lock()  # (a Connection is not thread-safe)
         self.handles = {}
@@ -152,19 +164,112 @@ class EngineClient:
         self.config_answers = {}           # change number -> the worker's settings after it
         self.config_n = 0
         self.restarts = 0
-        self.stopping = False
-        self.start()
+        self.stopping = False              # the server is shutting down
+        self.wanted = autostart            # the engine should run (stopped from the admin API: False)
+        self.life = threading.Lock()       # start / stop / restart, one at a time
+        self.gen = 0                       # engine generation (a stop or start makes a pending auto-restart stale)
+        self.proc = None
+        if autostart:
+            self.start()
+        elif idle_unload > 0:  # (no VRAM in use until the first request, as after an idle unload)
+            self.on_demand = "unloaded"
+            HUB.engine_state_set("stopped", "engine not loaded (the first request loads it)")
+        else:
+            HUB.engine_state_set("stopped", "engine not started (ENGINE_AUTOSTART=0)")
+        threading.Thread(target=self.idle_watch, daemon=True, name="engine-idle").start()
 
     def start(self):
+        free = HUB.device_free_now()
+        HUB.engine_starting()
+        cfg = dict(self.cfg, env=dict(self.cfg.get("env", {}), Q27_DEVICE_FREE_BYTES=None if free is None else str(free)))
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
-        self.proc = ctx.Process(target=worker.run, args=(child, self.cfg), daemon=True, name="q27-engine")
+        self.proc = ctx.Process(target=worker.run, args=(child, cfg), daemon=True, name="q27-engine")
         self.proc.start()
         child.close()
         self.conn = parent
-        threading.Thread(target=self.reader, daemon=True, name="engine-reader").start()
+        threading.Thread(target=self.reader, args=(self.gen,), daemon=True, name="engine-reader").start()
 
-    def reader(self):
+    def state(self):
+        """stopped | loading | ready | restarting (after a crash) | stopping."""
+        return HUB.engine_state
+
+    def control(self, action):
+        """start | stop | restart the engine process; returns the state afterwards (start: "loading")."""
+        with self.life:
+            if action != "start" or self.on_demand == "unloaded":
+                self.on_demand = None  # (a stop from the admin API stays until a start from it)
+            if action in ("stop", "restart"):
+                self._stop()
+            if action in ("start", "restart") and not (self.proc is not None and self.proc.is_alive()):
+                self.wanted, self.restarts = True, 0
+                self.gen += 1
+                self.start()
+        return self.state()
+
+    def idle_watch(self):
+        """Stops the engine after idle_unload seconds without a request. The decision is taken under self.lock, as
+        submit() hands a request over, so that no request goes to an engine that is stopping."""
+        while not self.stopping:
+            time.sleep(min(1.0, self.idle_unload or 1.0))
+            with self.life:
+                with self.lock:
+                    if (self.stopping or self.idle_unload <= 0 or not self.ready.is_set() or self.on_demand or self.handles
+                            or time.monotonic() - self.last_active < self.idle_unload):
+                        continue
+                    self.on_demand = "unloaded"
+                HUB.add_log("admin", None, f"no request for {self.idle_unload:g} s: unloading the engine "
+                                           "(the next request loads it)")
+                self._stop()
+
+    def set_idle_unload(self, seconds):
+        """Changes the time without a request before an unload (0: off); the time runs from now."""
+        with self.lock:
+            self.idle_unload, self.last_active = seconds, time.monotonic()
+
+    def idle_state(self):
+        """For the stats page. unload_in: seconds until an unload, None if none is coming (off, loading, in use)."""
+        unload_in = None
+        if self.idle_unload > 0 and self.ready.is_set() and not self.on_demand and not self.handles:
+            unload_in = max(0.0, self.idle_unload - (time.monotonic() - self.last_active))
+        refused = self.refused
+        return {"idle_unload_s": self.idle_unload, "unloaded": self.on_demand == "unloaded", "unload_in": unload_in,
+                "refused": refused[1] if refused else None}
+
+    def wake(self):
+        """Starts the engine after an idle unload (the first request that needs it; the others wait with it)."""
+        with self.life:
+            if self.on_demand == "unloaded":
+                self.on_demand = "loading"
+                self.wanted, self.restarts = True, 0
+                self.gen += 1
+                HUB.add_log("admin", None, "a request is loading the engine")
+                self.start()
+
+    def _stop(self):
+        self.wanted = False
+        self.gen += 1
+        proc = self.proc
+        if proc is None or not proc.is_alive():
+            HUB.engine_state_set("stopped", "engine stopped")
+            return
+        HUB.engine_state_set("stopping", "stopping the engine")
+        if self.ready.is_set():  # (while loading it reads no messages)
+            try:
+                with self.send_lock:
+                    self.conn.send(("stop",))
+            except OSError:
+                pass
+            proc.join(timeout=15)
+        for kill in (proc.terminate, proc.kill):
+            if proc.is_alive():
+                kill()
+                proc.join(timeout=10)
+        self.ready.clear()
+        log(f"engine stopped (exit code {proc.exitcode})")
+        HUB.engine_state_set("stopped", "engine stopped: its VRAM is free")
+
+    def reader(self, gen):
         conn = self.conn
         try:
             while True:
@@ -172,8 +277,17 @@ class EngineClient:
                 kind = msg[0]
                 if kind == "ready":
                     self.info = msg[1]
+                    self.last_active = time.monotonic()
+                    self.on_demand = self.refused = None
                     self.ready.set()
                     log(f"engine ready: {self.info}")
+                    HUB.engine_ready(self.info, self.cfg)
+                elif kind == "memory":
+                    HUB.set_memory(msg[1])
+                elif kind == "stats":
+                    HUB.set_snapshot(msg[1])
+                elif kind == "event":
+                    HUB.event(msg[1], msg[2], msg[3])
                 elif kind == "metrics":
                     self.metrics.update(msg[1])
                 elif kind == "config":
@@ -184,40 +298,74 @@ class EngineClient:
                         self.config_seen.notify_all()
                 elif kind == "fatal":
                     log(f"engine failed: {msg[1]}")
+                elif kind == "refused":
+                    log(f"engine did not start: {msg[1]}")
+                    if self.idle_unload > 0 or self.on_demand:  # (no retries: the next request tries again; else as for a crash)
+                        self.wanted, self.refused = False, (time.monotonic(), msg[1])
+                        self.on_demand = "unloaded"
+                        HUB.engine_state_set("stopped", msg[1])
                 else:
                     rid = msg[1]
                     if kind == "done":
                         self.metrics.update(msg[3].pop("metrics", {}))
+                        HUB.finished(rid, msg[2], msg[3])
+                    elif kind == "error":
+                        HUB.failed(rid, msg[2])
                     with self.lock:
                         q = self.handles.get(rid)
                         if kind in ("done", "error"):
                             self.handles.pop(rid, None)
+                            self.last_active = time.monotonic()
                     if q is not None:
                         q.put(msg)
         except (EOFError, OSError):
             pass
         self.ready.clear()
+        planned = self.stopping or not self.wanted or gen != self.gen
         with self.lock:
             handles, self.handles = self.handles, {}
         for q in handles.values():
-            q.put(("error", None, "the engine stopped; it is restarting", 503))
-        if self.stopping:
+            q.put(("error", None, "the engine was stopped" if planned else "the engine stopped; it is restarting", 503))
+        if planned:
             return
+        self.on_demand = None  # (after a crash, as without idle_unload: 503 until the new engine is ready)
         self.proc.join(timeout=10)
         code = self.proc.exitcode
         self.restarts += 1
         delay = min(60, 2 ** min(self.restarts, 6))
         log(f"engine exited with code {code}; starting a new one in {delay} s")
+        HUB.engine_stopped(f"engine exited with code {code}; starting a new one in {delay} s")
         time.sleep(delay)
-        self.start()
+        with self.life:
+            if self.wanted and gen == self.gen and not self.stopping:
+                self.start()
+
+    def not_ready(self):
+        if not self.wanted:
+            return ApiError(503, "the engine is stopped (start it at /ui or with POST /admin/engine)", "overloaded_error")
+        return ApiError(503, "the engine is loading", "overloaded_error")
 
     def submit(self, req):
-        if not self.ready.is_set():
-            raise ApiError(503, "the engine is loading", "overloaded_error")
         rid = new_id("req-", 16)
         q = queue.Queue()
-        with self.lock:
-            self.handles[rid] = q
+        arrival = time.monotonic()
+        deadline = arrival + self.LOAD_WAIT_S
+        while True:
+            with self.lock:
+                self.last_active = time.monotonic()
+                on_demand = self.on_demand
+                if self.ready.is_set() and on_demand != "unloaded":
+                    self.handles[rid] = q
+                    break
+            if not on_demand:
+                raise self.not_ready()
+            if on_demand == "unloaded":
+                if self.refused and self.refused[0] >= arrival:  # (the load this request waited for)
+                    raise ApiError(503, self.refused[1], "overloaded_error")
+                self.wake()
+            if time.monotonic() > deadline:
+                raise ApiError(503, "the engine is loading", "overloaded_error")
+            self.ready.wait(0.2)
         try:
             with self.send_lock:
                 self.conn.send(("submit", rid, req))
@@ -225,12 +373,13 @@ class EngineClient:
             with self.lock:
                 self.handles.pop(rid, None)
             raise ApiError(503, "the engine is restarting", "overloaded_error") from e
+        HUB.submitted(rid)
         return rid, q
 
     def configure(self, changes):
         """Changes the admission settings (kept for a restarted engine); returns the worker's settings."""
         if not self.ready.is_set():
-            raise ApiError(503, "the engine is loading", "overloaded_error")
+            raise self.not_ready()
         self.cfg.update(changes)
         with self.config_seen:
             self.config_n += 1
@@ -256,6 +405,8 @@ class EngineClient:
 
     def stop(self):
         self.stopping = True
+        if self.proc is None:
+            return
         try:
             with self.send_lock:
                 self.conn.send(("stop",))
@@ -292,7 +443,7 @@ class Detokenizer:
 
     def _decode(self, ids):
         with self.lock:
-            return self.tok.decode(ids, skip_special_tokens=False)
+            return self.tok.decode(ids)
 
     def add(self, ids, final=False):
         self.ids += ids
@@ -314,7 +465,10 @@ class Generation:
         self.stops = [s for s in stop if s]
         self.prompt_tokens = len(ids)
         self.finish, self.stop_sequence, self.cached = None, None, 0
-        self.tokens = 0
+        self.tokens, self.timings = 0, None
+        # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
+        # it, and when the first token came.
+        self.prefilled, self.toks, self.first_tok = None, [], None
         req = dict(ids=ids, max_new=max_new, images=images, **sampling)
         self.rid, self.q = server.engine.submit(req)
         self.detok = Detokenizer(server.tok, server.tok_lock)
@@ -361,8 +515,12 @@ class Generation:
                 kind = msg[0]
                 if kind == "start":
                     self.cached = msg[2]["cached"]
+                elif kind == "prefilled":
+                    self.prefilled, self.toks = msg[2], self.toks[-1:]  # (it follows the prefill's token)
                 elif kind == "tok":
                     self.tokens += len(msg[2])
+                    self.toks.append((time.time(), len(msg[2])))
+                    self.first_tok = self.first_tok or self.toks[-1][0]
                     self.text += self.detok.add(msg[2])
                     piece = self._release()
                     if piece:
@@ -380,16 +538,55 @@ class Generation:
                 elif kind == "error":
                     raise ApiError(msg[3] if len(msg) > 3 else 500, msg[2],
                                    "overloaded_error" if (len(msg) > 3 and msg[3] == 503) else "api_error")
+            if self.timings is None:
+                self._stopped_timings()
         except BaseException:
             if self.finish is None:
                 self.cancel()
             raise
+
+    def _stopped_timings(self):
+        """A stop string ended the request. The engine's report follows the cancel only after its next step, which
+        the response does not wait for (a closed-loop client would lose that much decode time per request): the
+        timings are the prompt side the engine sent after the prefill ("prefilled") and the verify steps since then,
+        one "tok" each, timed here."""
+        p, toks = self.prefilled, self.toks
+        if p is None or not toks:
+            return
+        steps = len(toks) - 1  # (the first is the prefill's token)
+        accepted = sum(n for _, n in toks[1:]) - steps if p["draft_block"] else 0  # (a step: accepted drafts + 1)
+        self.timings = {"computed_tokens": p["computed_tokens"], "prefill_s": p["prefill_s"], "ttft": p["ttft"],
+                        "total": p["ttft"] + toks[-1][0] - self.first_tok,
+                        "drafted": p["drafted"] + steps * p["draft_block"], "draft_accepted": p["draft_accepted"] + accepted}
 
     @property
     def usage(self):
         return {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.tokens,
                 "total_tokens": self.prompt_tokens + self.tokens,
                 "prompt_tokens_details": {"cached_tokens": self.cached}}
+
+    @property
+    def timing_fields(self):
+        """llama.cpp's `timings` object as response fields ({} without the engine's report). As there,
+        prompt_n + cache_n is the whole prompt and predicted_per_second is predicted_n / predicted_ms. The prompt
+        rates use the tokens really prefilled: a preempted request prefills more than prompt_n."""
+        t = self.timings
+        if t is None:
+            return {}
+        computed, prompt_ms = t["computed_tokens"], t["prefill_s"] * 1000
+        n, predicted_ms = self.tokens, (t["total"] - t["ttft"]) * 1000 if t["ttft"] is not None else 0.0
+        rated = n > 1 and predicted_ms > 0  # (one token: no time to rate it over)
+        drafts = {"draft_n": t["drafted"], "draft_n_accepted": t["draft_accepted"]} if t.get("drafted") else {}
+        return {"timings": {
+            "cache_n": self.cached,
+            "prompt_n": max(self.prompt_tokens - self.cached, 0),
+            "prompt_ms": prompt_ms,
+            "prompt_per_token_ms": prompt_ms / computed if computed else 0.0,
+            "prompt_per_second": computed * 1000 / prompt_ms if prompt_ms > 0 else 0.0,
+            "predicted_n": n,
+            "predicted_ms": predicted_ms,
+            "predicted_per_token_ms": predicted_ms / n if rated else 0.0,
+            "predicted_per_second": n * 1000 / predicted_ms if rated else 0.0, **drafts}}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -398,36 +595,61 @@ class Generation:
 class Server:
     """What the handlers share: the engine client, tokenizer, images, limits."""
 
-    def __init__(self, engine, tok, max_tokens, images, thinking_default=True):
-        self.engine, self.tok, self.images = engine, tok, images
+    def __init__(self, engine, tok, max_tokens, launch, thinking_default=True):
+        self.engine, self.tok, self.launch = engine, tok, launch
         self.tok_lock = threading.Lock()
+        self.images_lock = threading.Lock()
+        self._images = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
-        self.pad_id = tok.convert_tokens_to_ids("<|image_pad|>")
+        self.pad_id = tok.token_id("<|image_pad|>")
 
     @property
     def max_tokens(self):
         """The engine's context capacity (MAX_TOKENS, lowered to what the VRAM fits; MAX_TOKENS_FIT)."""
         return self.engine.info.get("max_tokens", self.max_tokens_conf)
 
+    @property
+    def images(self):
+        """The image processor while the engine is set up with the vision tower (made when first needed)."""
+        cfg = self.engine.cfg
+        if cfg["env"]["VISION"] == "off":
+            return None
+        with self.images_lock:
+            if self._images is None:
+                self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))
+            return self._images
+
     def encode(self, text):
         with self.tok_lock:
-            return self.tok(text, add_special_tokens=False).input_ids
+            return self.tok.encode(text)
+
+    def use_template_of(self, weights):
+        """Renders prompts with the chat template of `weights` from here on (an engine start on them; their tokenizer
+        has the server's ids, Launch.weights_choices). The tokenizer itself stays the server's."""
+        from tokenizer import Tokenizer
+
+        path = model_dir(weights)
+        if path == self.tok.template_path:
+            return
+        tok = Tokenizer(self.tok.path, template=path)
+        with self.tok_lock:
+            self.tok = tok
 
     def render(self, messages, tools, kwargs):
         """Prompt ids (images expanded) and the images, of chat messages."""
         try:
             with self.tok_lock:
-                prompt = self.tok.apply_chat_template(messages, tools=tools or None, add_generation_prompt=True,
-                                                      tokenize=False, **kwargs)
+                prompt = self.tok.render(messages, tools=tools or None, **kwargs)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
         ids = self.encode(prompt)
         urls, images = Images.collect(messages), None
         if urls:
-            if self.images is None:
-                raise ApiError(400, "this server does not take images (start it with VISION=host, fp8 or bf16)")
-            ids, spans, pixels = self.images.prepare(ids, urls, self.pad_id)
+            proc = self.images
+            if proc is None:
+                raise ApiError(400, "this server does not take images (start the engine with VISION=host, fp8 or bf16)")
+            ids, spans, pixels = proc.prepare(ids, urls, self.pad_id)
             images = (spans, pixels)
         return ids, images
 
@@ -456,12 +678,18 @@ def stops_of(value):
     return [value] if isinstance(value, str) else [s for s in value if isinstance(s, str)]
 
 
+class HTTPServer(ThreadingHTTPServer):
+    # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     srv: Server = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics"):
+        if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics", "/ui/state"):
             return  # (polled by the healthcheck and the benchmarks)
         sys.stderr.write("[api] " + fmt % args + "\n")
 
@@ -505,10 +733,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
-            if self.srv.engine.ready.is_set():
+            if self.srv.engine.on_demand:  # (the service is up: a request loads the engine and waits for it)
+                refused = self.srv.engine.refused
+                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {})})
+            elif self.srv.engine.ready.is_set():
                 self._json(200, {"status": "ok"})
             else:
-                self._json(503, {"status": "loading"})
+                self._json(503, {"status": self.srv.engine.state()})
         elif path == "/metrics":
             body = "".join(f"{k} {v}\n" for k, v in sorted(self.srv.engine.metrics.items())).encode()
             self.send_response(200)
@@ -527,15 +758,51 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, card)
         elif path == "/admin/concurrency":
             if not self.srv.engine.ready.is_set():
-                return self._error(503, "the engine is loading", "overloaded_error")
+                e = self.srv.engine.not_ready()
+                return self._error(e.code, str(e), e.kind)
             self._json(200, self.srv.engine.config)
+        elif path == "/admin/engine":
+            self._json(200, self.engine_settings())
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
+        elif path == "/ui":
+            body = UI_PAGE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/ui/state":
+            self._json(200, dict(HUB.init(), tick=HUB.tick()))
+        elif path == "/ui/stream":
+            self.ui_stream()
         else:
             self._error(404, "not found", "not_found")
 
+    def ui_stream(self):
+        """Server-sent events of the stats UI: "init" (configuration, sample history, log), then "tick" (the
+        requests, VRAM, last GPU sample) every second and "log" (new entries) as they come."""
+        self._sse_start()
+        try:
+            init = dict(HUB.init(), tick=HUB.tick())
+            self._sse(init, "init")
+            seen = init["log"][-1]["n"] if init["log"] else 0
+            last = time.time()
+            while True:
+                HUB.wait(1.0)
+                new = HUB.log_since(seen)
+                if new:
+                    seen = new[-1]["n"]
+                    self._sse(new, "log")
+                if time.time() - last >= 1.0:
+                    last = time.time()
+                    self._sse(HUB.tick(), "tick")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def do_HEAD(self):
-        self.send_response(200 if self.srv.engine.ready.is_set() else 503)
+        self.send_response(200 if self.srv.engine.ready.is_set() or self.srv.engine.on_demand else 503)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -548,18 +815,27 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as e:
             return self._error(400, f"bad JSON: {e}")
         path = self.path.split("?")[0].rstrip("/")
-        if DUMP_DIR:  # (debug: the requests as clients send them)
-            name = f"{time.strftime('%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
-            (pathlib.Path(DUMP_DIR) / name).write_text(json.dumps(body, ensure_ascii=False, indent=1))
+        if DUMP_DIR:  # (debug: the requests as clients send them; a failed write does not fail the request)
+            name = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
+            try:
+                d = pathlib.Path(DUMP_DIR)
+                d.mkdir(parents=True, exist_ok=True)
+                (d / name).write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+            except OSError as e:
+                log(f"API_DUMP_DIR: {e}")
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
-                  "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency}
+                  "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,
+                  "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan,
+                  "/admin/engine/idle": self.engine_idle}
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
+        HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
         try:
             fn(body)
         except ApiError as e:
+            HUB.http_error(path, e.code, str(e))
             self._error(e.code, str(e), e.kind)
         except (AnthropicError, ValueError, KeyError, TypeError) as e:
             self._error(400, f"{type(e).__name__}: {e}" if not isinstance(e, (AnthropicError, ValueError)) else str(e))
@@ -617,7 +893,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"id": rid, "object": "chat.completion", "created": created, "model": model,
                          "choices": [{"index": 0, "message": msg, "finish_reason": finish, "logprobs": None,
                                       "stop_reason": gen.stop_sequence}],
-                         "usage": gen.usage})
+                         "usage": gen.usage, **gen.timing_fields})
 
     def _keepalive_comment(self):
         self.wfile.write(b": keep-alive\n\n")
@@ -626,9 +902,9 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_stream(self, gen, parser, rid, created, model, body, single_call):
         self._sse_start()
 
-        def chunk(delta, finish=None):
+        def chunk(delta, finish=None, **extra):
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": None}]})
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": None}], **extra})
 
         chunk({"role": "assistant", "content": ""})
         ncalls = 0
@@ -652,10 +928,11 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({"error": {"message": str(e), "type": e.kind, "code": e.code}})
             self.wfile.write(b"data: [DONE]\n\n")
             return
-        chunk({}, "tool_calls" if ncalls else gen.finish)
-        if (body.get("stream_options") or {}).get("include_usage"):
+        include_usage = (body.get("stream_options") or {}).get("include_usage")  # (timings go on the last chunk)
+        chunk({}, "tool_calls" if ncalls else gen.finish, **({} if include_usage else gen.timing_fields))
+        if include_usage:
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [], "usage": gen.usage})
+                       "choices": [], "usage": gen.usage, **gen.timing_fields})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -681,18 +958,20 @@ class Handler(BaseHTTPRequestHandler):
             for piece in gen:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
                            "choices": [{"index": 0, "text": piece, "finish_reason": None, "logprobs": None}]})
+            include_usage = (body.get("stream_options") or {}).get("include_usage")
             self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": None}]})
-            if (body.get("stream_options") or {}).get("include_usage"):
+                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": None}],
+                       **({} if include_usage else gen.timing_fields)})
+            if include_usage:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                           "choices": [], "usage": gen.usage})
+                           "choices": [], "usage": gen.usage, **gen.timing_fields})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
         text = "".join(gen)
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": model,
                          "choices": [{"index": 0, "text": text, "finish_reason": gen.finish, "logprobs": None}],
-                         "usage": gen.usage})
+                         "usage": gen.usage, **gen.timing_fields})
 
     # ------------------------------------------------------------ Anthropic messages
 
@@ -889,6 +1168,86 @@ class Handler(BaseHTTPRequestHandler):
         changes = {k: int(v) if k in ("target_seqs", "kv_reserve") else v for k, v in body.items()}
         self._json(200, self.srv.engine.configure(changes))
 
+    def engine_settings(self):
+        """GET /admin/engine: the state, the settings of the running engine and of the next start, the weights, and the
+        variables that would keep what changed since the server started."""
+        eng, launch = self.srv.engine, self.srv.launch
+        (device, source) = HUB.plan_device()
+        running = eng.cfg.get("settings") if eng.state() != "stopped" else None
+        keep = launch.env_changes()
+        if eng.idle_unload != eng.idle_unload_at_start:
+            keep["ENGINE_IDLE_UNLOAD_S"] = f"{eng.idle_unload:g}"
+        return {"state": eng.state(), "unloaded": eng.on_demand == "unloaded", "idle_unload_s": eng.idle_unload, "keep_env": keep,
+                "at_start": launch.at_start,
+                "refused": eng.refused[1] if eng.refused else None,
+                "running": running, "settings": launch.settings,
+                "weights": launch.weights_choices(), "device": {"free": device[0], "total": device[1], "source": source}
+                if device else None}
+
+    def engine_plan(self, body):
+        """{"settings": {...}} (changes to the next start's settings): their memory plan and, for each setting, the
+        plans of its other values."""
+        settings = body.get("settings") or {}
+        if not isinstance(settings, dict):
+            raise ApiError(400, "settings: an object")
+        device, source = HUB.plan_device()
+        if device is None:
+            raise ApiError(503, "the device's memory is unknown (no NVML and no engine started yet)", "overloaded_error")
+        self._json(200, self.srv.launch.plan_answer(settings, device, source))
+
+    def engine_idle(self, body):
+        """{"idle_unload_s": seconds} (0: off): applies at once, until the server restarts. Needs Content-Type:
+        application/json, like engine_control."""
+        if self.headers.get_content_type() != "application/json":
+            raise ApiError(415, "send the setting as JSON (Content-Type: application/json)")
+        v = body.get("idle_unload_s")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v < float("inf"):
+            raise ApiError(400, "idle_unload_s: seconds, 0 or more (0: off)")
+        self.srv.engine.set_idle_unload(float(v))
+        HUB.add_log("admin", None, f"unload when idle: {f'after {v:g} s without a request' if v else 'off'}")
+        self._json(200, self.srv.engine.idle_state())
+
+    def engine_control(self, body):
+        """{"action": "start" | "stop" | "restart" | "save", "settings": {...}}: the engine process (stop frees its VRAM;
+        requests in flight fail with 503). Start and restart take changes to the start settings (launch.py), kept for
+        later starts; save only keeps them for the next load, while the engine is stopped or unloaded, without asking
+        whether they fit the VRAM free now (the load does). Needs Content-Type: application/json, so that a web page
+        cannot send it with a plain form."""
+        if self.headers.get_content_type() != "application/json":
+            raise ApiError(415, "send the action as JSON (Content-Type: application/json)")
+        action, settings = body.get("action"), body.get("settings")
+        if action not in ("start", "stop", "restart", "save"):
+            raise ApiError(400, "action: start, stop, restart or save")
+        if action == "save" and settings is None:
+            raise ApiError(400, "settings: what to save")
+        eng, launch = self.srv.engine, self.srv.launch
+        note = ""
+        if settings is not None:
+            if action == "stop" or not isinstance(settings, dict):
+                raise ApiError(400, "settings: an object, with start or restart")
+            if action in ("start", "save") and eng.state() != "stopped":
+                raise ApiError(409, "the engine is running: restart it to change its settings")
+            device, _ = HUB.plan_device()
+            s = launch.validate(settings, device=device, check_budget=action != "save")
+            if device is not None and action != "save":
+                plan = launch.plan_many([s], device)[0]
+                if "error" in plan or not plan["fits"]:
+                    raise ApiError(400, f"these settings do not fit: {plan.get('error') or 'the device pools exceed the budget'}")
+            try:
+                cfg = launch.config(s)
+            except FileNotFoundError as e:
+                raise ApiError(400, str(e)) from e
+            # (the admission settings of /admin/concurrency stay; the target number of requests with the same MAX_SEQS)
+            keep = ("admit_kv", "kv_reserve", "min_seq_tps") + (("target_seqs",) if s["max_seqs"] == eng.cfg["max_seqs"] else ())
+            self.srv.use_template_of(s["weights"])
+            launch.settings, eng.cfg = s, dict(cfg, **{k: eng.cfg[k] for k in keep if k in eng.cfg})
+            note = " with " + ", ".join(f"{k}={v}" for k, v in s.items())
+        if action == "save":
+            HUB.add_log("admin", None, f"settings for the next load:{note.removeprefix(' with')}")
+            return self._json(200, {"state": eng.state(), "settings": launch.settings})
+        HUB.add_log("admin", None, f"engine {action} requested{note}", level="warn" if action != "start" else "info")
+        self._json(200, {"state": eng.control(action), "settings": launch.settings})
+
     def tokenize(self, body):
         if "messages" in body:
             kwargs = template_kwargs(body, self.srv.thinking_default)
@@ -899,7 +1258,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def detokenize(self, body):
         with self.srv.tok_lock:
-            text = self.srv.tok.decode(body.get("tokens") or [], skip_special_tokens=False)
+            text = self.srv.tok.decode(body.get("tokens") or [])
         self._json(200, {"prompt": text})
 
 
@@ -997,7 +1356,7 @@ START_TIME = time.time()
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default=env("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(env("PORT", 8000)))
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
@@ -1020,38 +1379,30 @@ def main():
                     help="decode turn of a request when several decode")
     ap.add_argument("--batch-decode", type=int, default=int(env("BATCH_DECODE", 1)),
                     help="1: requests in decode step together (batched speculative steps); 0: they take turns")
+    ap.add_argument("--idle-unload", type=float, default=float(env("ENGINE_IDLE_UNLOAD_S", 0)),
+                    help="stop the engine after this many seconds without a request, freeing its VRAM; the next "
+                         "request loads it again (0: off, the engine stays ready)")
     args = ap.parse_args()
 
-    from transformers import AutoTokenizer
+    from tokenizer import Tokenizer, fingerprint
 
-    from qwen27b.weights import DFLASH2, engine_target, snapshot
-
-    path = engine_target(args.weights)  # (quasar: sets Q27_LM_HEAD_CKPT, its lm_head is the BF16 original)
-    tok = AutoTokenizer.from_pretrained(path)
-    eos = json.loads((path / "generation_config.json").read_text())["eos_token_id"]
-    draft = snapshot(*DFLASH2) if args.spec == "dflash2" else None
+    path = model_dir(args.weights)  # (the tokenizer: other weights must have the same, Launch.weights_choices)
+    tok = Tokenizer(path)
+    set_engine_env(ROOT)
+    base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
+            "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
+            "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
+            "engine_python": str(ROOT / "engine/python")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
-    os.environ.setdefault("VISION", "host")
-    os.environ["MAX_SEQS"] = str(max(1, args.max_seqs))  # (the engine's parking areas)
-    # MAX_TOKENS is an upper bound: the engine lowers it to what the VRAM budget fits (e.g. with MAX_SEQS=8).
-    os.environ.setdefault("MAX_TOKENS_FIT", "1")
-    if draft and "Q27_DRAFT_VOCAB" not in os.environ:
-        vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
-        if vocab.exists():
-            os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
-    cfg = {"model": str(path), "draft": str(draft) if draft else None, "max_tokens": args.max_tokens,
-           "prefill_chunk": args.prefill_chunk, "kv_dtype": args.kv_dtype, "max_seqs": max(1, args.max_seqs),
-           "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv), "kv_reserve": args.kv_reserve,
-           "decode_share": args.decode_share, "quantum_ms": args.quantum_ms, "batch_decode": bool(args.batch_decode),
-           "eos": eos if isinstance(eos, list) else [eos], "im_start": tok.convert_tokens_to_ids("<|im_start|>"),
-           "engine_python": str(ROOT / "engine/python")}
-    engine = EngineClient(cfg)
-    images = None
-    if os.environ.get("VISION", "off") != "off":  # (the image processor also needs IMAGE_MAX_PIXELS)
-        images = Images(path, int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))
-    Handler.srv = Server(engine, tok, args.max_tokens, images)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
+    launch = Launch(base, dict(env_settings(), weights=args.weights, kv_dtype=args.kv_dtype, spec=args.spec,
+                               max_seqs=max(1, min(args.max_seqs, 8)), max_tokens=args.max_tokens),
+                    tokenizer=fingerprint(path))
+    HUB.start()
+    engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
+                          idle_unload=max(0.0, args.idle_unload))
+    HUB.engine_idle = engine.idle_state
+    Handler.srv = Server(engine, tok, args.max_tokens, launch)
+    server = HTTPServer((args.host, args.port), Handler)
 
     def stop(*_):
         log("stopping")
@@ -1060,7 +1411,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine is loading)")
+    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine {'is loading' if engine.wanted else 'is not loaded'})")
     server.serve_forever()
     engine.stop()
 
