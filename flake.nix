@@ -57,19 +57,6 @@
 
       cuda = pkgs.cudaPackages_13_3;  # matches the dev image (nvidia/cuda:13.3.0-devel)
 
-      # CUTLASS v4.8 (sm_120a block-scaled FP4), pinned to the exact commit the engine was developed
-      # against (dev/Dockerfile arg CUTLASS_COMMIT). nixpkgs cudaPackages.cutlass (4.7.1) predates the
-      # block-scaled MMA features the engine uses, so we fetch the source directly.
-      # fetchgit (not fetchFromGitHub): GitHub's on-demand commit tarballs are byte-non-deterministic,
-      # so any pinned tarball hash eventually rots. fetchgit hashes the checked-out tree deterministically
-      # and matches how the dev Docker image provisions CUTLASS (git clone + checkout, no submodules).
-      cutlass = pkgs.fetchgit {
-        url = "https://github.com/NVIDIA/cutlass";
-        rev = "098de2a652cf8f00fd70b2df54051c7eccbb855a";
-        hash = "sha256-FiXSg6DMUAV9Gf5LOePKAwmGLVPxphq6MVwHZwwsKDM=";
-        fetchSubmodules = false;
-      };
-
       # --- engine: C++/CUDA shared library (libq27.so) ---
       engine = pkgs.stdenv.mkDerivation (finalAttrs: {
         pname = "qwen38-engine";
@@ -86,8 +73,6 @@
           cuda.cuda_cudart
           (lib.getOutput "static" cuda.cuda_cudart)
         ];
-
-        env.CUTLASS_DIR = cutlass;
 
         # The CMakeLists already sets CMAKE_CUDA_ARCHITECTURES=120a, CMAKE_BUILD_TYPE=Release,
         # CMAKE_CUDA_STANDARD=20. We only need to tell nixpkgs to use CMake+Ninja.
@@ -216,7 +201,6 @@
             pytest
           ]))
         ];
-        env.CUTLASS_DIR = cutlass;
       };
 
       # NixOS module: systemd service for the engine.
