@@ -279,7 +279,10 @@ in
         ARCANE_GPU_LOCK = cfg.gpuLockFile;
       }) // cfg.extraEnv;
 
-      path = [ pkgs.bash cfg.serve ] ++ cfg.extraPath;
+      # nvidia-smi lives in the driver's separate `bin` output; include it
+      # explicitly because systemd services do not inherit the interactive
+      # system PATH.
+      path = [ pkgs.bash cfg.serve config.hardware.nvidia.package.bin ] ++ cfg.extraPath;
 
       serviceConfig = cfg.serviceConfig // {
         User = cfg.user;
