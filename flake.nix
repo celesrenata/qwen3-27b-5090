@@ -85,6 +85,13 @@
         # dir: "The source directory /build/engine/build does not contain CMakeLists.txt".
         cmakeConfigureArgs = [ "-G" "Ninja" ];
 
+        # No check phase: the engine's tests (engine/tests/) are GPU-gated Python
+        # — they load libq27.so via ctypes and `pytest.skip` without a CUDA device,
+        # and the build pool's torch-bin is CPU-only, so they can't run in CI.
+        # Set doCheck explicitly (nixpkgs default is already false) so this stays
+        # a build-only package; run the tests manually on a 5090 box.
+        doCheck = false;
+
         meta = with pkgs.lib; {
           description = "Qwen3.8-27B inference engine (C++/CUDA, SM120)";
           license = licenses.mit;
@@ -114,7 +121,17 @@
       repoFiles = pkgs.stdenv.mkDerivation {
         pname = "qwen38-runtime-files";
         version = "0.1.0";
-        src = self;
+        src = lib.cleanSourceWith {
+          src = self;
+          # Ship only the runtime tree the server reads at runtime. Drop VCS
+          # metadata and Python bytecode: any __pycache__/ *.pyc present in the
+          # checkout are for the dev machine's interpreter, not serve's
+          # python3.12, and would make this store path non-reproducible across
+          # machines (different CPython -> different .pyc).
+          filter = name: type:
+            let base = builtins.baseNameOf name;
+            in !(base == ".git" || base == "__pycache__" || lib.hasSuffix ".pyc" base);
+        };
         installPhase = ''
           mkdir -p $out
           cp -r frontend $out/frontend
