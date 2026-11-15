@@ -42,6 +42,12 @@ struct Options {
   // Lower max_tokens to what the VRAM budget leaves for the KV pool (rounded down to 1,024) instead of
   // failing (MAX_TOKENS_FIT; the server sets it). Not with kv_pool_tokens.
   bool fit_max_tokens = false;
+  // Fail instead of starting with a KV pool of fewer tokens (MIN_KV_TOKENS; 0: any size).
+  int min_kv_tokens = 0;
+  // Plan only (q27_plan): size the pools for a device with plan_free of plan_total bytes free and stop there, with
+  // no CUDA call (nothing allocated or loaded; memory_report, max_tokens, cache_stats and device_memory answer).
+  bool plan_only = false;
+  size_t plan_free = 0, plan_total = 0;
 };
 
 class Model {
@@ -58,8 +64,23 @@ class Model {
   // the top-k (ids, log-probs) of the next token. k <= 64.
   void forward_topk(const int32_t* ids, int n, int k,
                     const std::function<void(int pos, const int32_t* ids, const float* logp)>& cb);
-  // Runs ids[0..n) and samples the token after the last one.
-  int32_t forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform);
+  // Runs ids[0..n) and samples the token after the last one. presence / frequency: penalties (Penalty) by
+  // the running sequence's output counts, which this and the speculative steps keep (see penalty_init).
+  // logprobs >= 0: the token's logprobs with that many top entries (see logprobs()). masked: the logits are masked by
+  // row 0 of mask_rows() first. biased: the running sequence's logit bias (bias_set) is added to the logits first.
+  int32_t forward_sample(const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
+                         float min_p = 0.f, float presence = 0.f, float frequency = 0.f, int logprobs = -1,
+                         bool masked = false, bool biased = false);
+  // The logprobs of the tokens the last forward_sample / spec_begin / spec_step returned (lane -1), or of lane z of
+  // the last spec_step_lanes; n = 0 when that sequence's sampling has none (SpecSampling::logprobs).
+  const Logprobs& logprobs(int lane = -1) const { return last_lp_[lane < 0 ? 0 : lane]; }
+  // The running sequence's output so far, ids[0..n), as the penalty counts (before the first sampled
+  // token of a request with penalties; parked sequences keep theirs).
+  void penalty_init(const int32_t* ids, int n);
+  // The running sequence's logit bias (BiasList; n <= kMaxBias entries, n = 0: none) and min_tokens (eos_before: the
+  // end-of-sequence ids are banned for the tokens at positions below it; 0: none), used by the calls whose sampling
+  // is biased (forward_sample's biased, SpecSampling::biased); parked sequences keep theirs.
+  void bias_set(const int32_t* ids, const float* vals, int n, int eos_before = 0);
 
   // Per-op GPU time (Q27_PROFILE=1): every op records an event when it starts; prints the totals
   // per label since the last dump to stderr and resets them.
@@ -76,7 +97,30 @@ class Model {
   // ahead (default): launch the next step before returning this one (Q27_SPEC_PIPELINE); false when
   // the caller will not continue right away (another sequence runs next), so no step is wasted.
   int spec_step(int32_t* out, bool ahead = true);
+  // Grammar masks (structured output): kMaskRows bitmasks of kMaskWords words in pinned host memory that the
+  // host writes (bit t % 32 of word t / 32: token t allowed); row 16 z + i masks verify row i of lane z (z = 0 alone).
+  // A sequence begun with SpecSampling::masked steps in two calls: spec_draft drafts the step and returns its verify
+  // tokens (chain[16]: the last token, then the drafted ones; such a sequence verifies a chain), the host writes the
+  // mask of each row (the grammar after the row's tokens), and spec_step verifies and accepts with them (no step is
+  // launched ahead). spec_draft_lanes is the same for spec_step_lanes (chain [n][16], each lane's block rows, -1
+  // after them; lanes without masks need it too when one lane has them).
+  static constexpr int kMaskWords = (dims::kVocab + 31) / 32;
+  static constexpr int kMaskRows = kMaxLanes * kSpecBlock;
+  uint32_t* mask_rows() const { return mask_host_; }
+  void spec_draft(int32_t* chain);
+  void spec_draft_lanes(const int32_t* lanes, int n, int32_t* chain);
+  // Masks a decoding sequence (area -1: the running one, else a parked one) from its next step on, as if begun with
+  // SpecSampling::masked (the grammar starts after the reasoning; its end, stop[2], no longer ends a step); a step
+  // launched ahead is dropped.
+  void spec_set_masked(int area);
+  // Pins a decoding sequence's verify width (area -1: the running one) to `block` rows (2 .. the draft's block; DFlash2
+  // 8) for its single and batched steps: tests (batched lanes of given widths against single runs).
+  void spec_set_block(int area, int block);
   bool has_draft() const { return draft_ != nullptr; }
+  int spec_block() const { return draft_ ? draft_->block() : 0; }
+  int last_step_block() const { return last_block_; }  // rows of the block the last spec_step returned (adaptive width)
+  // Rows of lane z's block in the last spec_step_lanes / spec_draft_lanes.
+  int last_lane_block(int z) const { return z >= 0 && z < blr_.n ? blr_.rows(z) : 0; }
   // Counters since the last call: verify steps, steps that used the lookup chain, tokens produced.
   void spec_stats(int64_t* out);
   // Debug: KV rows (K then V, raw bytes) of attention layer `layer` at positions pos..pos+n-1, and the
@@ -93,9 +137,18 @@ class Model {
   int prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, bool spec);
   // Saves a checkpoint of the sequence so far (e.g. at the end of a generation).
   void checkpoint();
-  // out[11]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
-  // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area.
+  // out[12]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
+  // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area, state
+  // slots allocated.
   void cache_stats(int64_t* out) const;
+  // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
+  // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
+  int grow_state_cache(int n);
+  // Memory (stats UI): one line per pool ("pool\t<name>\t<host 0|1>\t<bytes>") followed by its reservations
+  // ("item\t<name>\t<what>\t<bytes>"), and "slots\t<state cache slots>\t<bytes of a checkpoint>". Fixed after
+  // the constructor. device_memory: out[4] = free now, total (cudaMemGetInfo), free at the start, budget.
+  std::string memory_report() const;
+  void device_memory(int64_t* out) const;
 
   // Prompt chunks before forward_sample / spec_begin (Phase 6: other sequences can run between them).
   // ids[0..n) is the rest of the prompt after the sequence's position; runs chunks while more than one
@@ -120,12 +173,22 @@ class Model {
   void seq_suspend(int a);
   int park_slots() const { return int(parked_.size()); }
 
-  // Batched speculative steps (P6-10). One step of each of n (2..4) sequences in decode (after spec_begin):
+  // Device memory lent for a while (video decoding on NVDEC, whose surfaces the driver allocates outside the pools):
+  // kv_lend moves the KV pages out of whole blocks just below the parking areas (below earlier loans), evicting
+  // checkpoints if it must, as seq_park does, and gives their memory back to the device (the KV pool is VMM).
+  // Returns a loan id, or -1 with nothing changed but evicted checkpoints when the pool cannot spare `bytes` or
+  // the pool is not VMM. kv_unlend(id) maps memory there again and gives the pages back to the pool.
+  int kv_lend(size_t bytes);
+  void kv_unlend(int id);
+  size_t kv_lent() const;  // bytes on loan now
+
+  // Batched speculative steps (P6-10). One step of each of n (2..8) sequences in decode (after spec_begin):
   // lanes[z] is -1 for the running sequence or a parking area. Their draft blocks and verify rows run as one
-  // batch (the GEMMs read the weights once for all), each lane exactly as its own spec_step: the tokens are
-  // the same, bit for bit. Lane z's new tokens go to out[8 z ..], their count to counts[z]. While the same
-  // lanes keep stepping their state stays in the batch; any other call first ends it (the lanes then hold
-  // their sequences as before, nothing pending). Chains only (Q27_SPEC_PATHS 1); no lookup drafting.
+  // batch (the GEMMs read the weights once for all), each lane exactly as its own spec_step of the same width: the
+  // tokens are the same, bit for bit, unless the step's row budget cut a lane's width. Lane z's new tokens
+  // go to out[16 z ..], their count to counts[z]. While the same lanes keep stepping their state stays in the batch;
+  // any other call first ends it (the lanes then hold their sequences as before, nothing pending). Chains only
+  // (Q27_SPEC_PATHS 1); no lookup drafting.
   void spec_step_lanes(const int32_t* lanes, int n, int32_t* out, int32_t* counts);
   int max_lanes() const { return draft_ ? draft_->lanes() : 0; }
 
@@ -133,10 +196,12 @@ class Model {
   // frontend derives them from the image, so the prefix cache tells images apart) at positions
   // start .. start + gh * gw - 1, gh x gw the merged grid. mm_set (after reset / prefix_begin, before the
   // forward call) gives the request's images: spans [n][3] = (start, gh, gw), ascending. mm_encode runs
-  // the vision tower on image i (pixels [4 * gh * gw][1536] fp32, host) into its embedding rows; images
-  // whose positions the restored prefix covers need no encoding. mm_embeds copies them out (tests).
+  // the vision tower on image i (its pixels in host memory: VisionPixels, 2 gh x 2 gw patches) into its
+  // embedding rows; images whose positions the restored prefix covers need no encoding. mm_encode with n > 1
+  // encodes images i .. i + n - 1 of one grid (a video's frame pairs, pixels[n]) in as few passes as the
+  // workspace allows. mm_embeds copies them out (tests).
   void mm_set(const int32_t* spans, int n);
-  void mm_encode(int i, const float* pixels);
+  void mm_encode(int i, const VisionPixels* pixels, int n = 1);
   void mm_embeds(int i, bf16* out);
   void mm_put(int i, const bf16* in);  // replaces image i's embeddings (tests: another vision tower)
   bool has_vision() const { return opt_.vision != 0; }
@@ -162,14 +227,28 @@ class Model {
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
   bool evict_checkpoint();           // the least recently used one; false when there is none
-  void spec_body(const SpecSampling& smp);
+  void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
+  void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
+  // Captures body; with update, updates that graph in place when only arguments / grids differ (else replaces it).
+  cudaGraphExec_t capture(const std::function<void()>& body, cudaGraphExec_t update = nullptr);
   void spec_flush();  // replays the last verify's commits into the GDN / conv states
   void set_sbuf(int b);  // host side of the GDN state buffer switch
-  int spec_rows(const SpecSampling& smp) const { return 1 + (kSpecBlock - 1) * std::max(1, smp.paths); }
+  int spec_block_of(const SpecSampling& smp) const { return smp.block > 0 ? smp.block : draft_->block(); }
+  int spec_rows(const SpecSampling& smp) const { return 1 + (spec_block_of(smp) - 1) * std::max(1, smp.paths); }
   GdnSpec gdn_spec(int gdn_layer) const;
   bool fused(int T) const;
   bf16* cap_for(int layer) const;
-  int32_t decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform);
+  int32_t decode_step(int32_t id, float temperature, int top_k, float top_p, float uniform, float min_p, Penalty pen,
+                      LogprobSink lp, bool masked, bool biased);
+  // Penalty counts [vocab]: the running sequence's (-1), or parking area a's.
+  uint32_t* pen_counts(int a = -1) const { return pen_ + size_t(a + 1) * dims::kVocab; }
+  // Logit bias list: the running sequence's (-1), or parking area a's.
+  BiasList* bias_list(int a = -1) const { return bias_ + (a + 1); }
+  BiasLanes running_bias() const {  // (a decode or prompt row)
+    BiasLanes b;
+    b.list[0] = bias_, b.pos[0] = pos_dev_;
+    return b;
+  }
   void logits(const float* x_rows, int rows);  // final norm + lm_head into logits_
   void gdn(int layer, int T);
   void attn(int layer, int T);
@@ -182,10 +261,12 @@ class Model {
   }
   QuantOut q8(float in_scale) const;  // quantize into aq_
   QuantOut q4(float in_scale) const;  // quantize into aq_ / asf_
-  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : q8(l.in_scale()); }
+  QuantOut q8row() const;             // quantize into aq_ per token, the row scales into ascale_
+  QuantOut qin(const LinearQ& l) const { return l.fp4 ? q4(l.in_scale()) : l.dyn ? q8row() : q8(l.in_scale()); }
   // The input of a projection from its fp32 rows x [T][K] (FP8 projections: the producing kernel already
   // wrote aq_; NVFP4 ones quantize here).
   void quant_in(const LinearQ& l, const float* x, int T, int K);
+  void mlp_fp8(const LayerWeights& L, int T);
   void mark(const char* label);  // start of an op (profiling only)
   void profile_collect(bool graph = false);  // after a step (graph: the replayed marks)
 
@@ -203,8 +284,12 @@ class Model {
   Options opt_;
   std::unique_ptr<SafeTensors> ckpt_;
   std::unique_ptr<SafeTensors> lm_ckpt_;  // Q27_LM_HEAD_CKPT: the NVFP4 lm_head of a BF16-lm_head model
+  Budget vram_;                      // the VRAM budget (make_budget), for device_memory
   Pool dev_weights_{"weights"}, host_weights_{"embedding", true}, kv_{"kv"}, state_{"state"}, act_{"activations"},
       host_cache_{"state cache", true}, host_mm_{"image embeddings", true};
+  // Load-time scratch placed in the KV pool (unused until the first request): the NVFP4 copy of an FP8 lm_head that
+  // the draft model only gathers its vocabulary head from.
+  Pool load_tmp_{"load-time scratch"};
   Weights w_;
   cudaStream_t s_ = nullptr;
   int pos_ = 0;
@@ -239,7 +324,7 @@ class Model {
   bool cache_on_ = false;
   std::vector<Checkpoint> ckpts_;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring
-  char* host_slots_ = nullptr;       // pinned [slots][ckpt_bytes_] (host_cache_)
+  std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;
   char* stage_ = nullptr;            // device copy of one checkpoint on its way to the host
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
@@ -289,23 +374,31 @@ class Model {
   int batch_n_ = 0;                  // set while chunk() runs a batched verify
   std::vector<int32_t> blanes_;      // the lanes of the batch (-1: the running sequence)
   bool batch_pending_ = false;       // a step ran: its commits are replayed when the batch ends
+  bool b_drafted_ = false;           // spec_draft_lanes drafted the step spec_step_lanes verifies next
   int bpar_ = 0;                     // the lanes' step parity (they step together)
   bool bwarm_ = false;
   AcceptLanes bacc_;                 // the lanes' sampling (chains) and top-k list lengths
   SeqLanes bsl_;                     // positions, rotary deltas and page tables of the lanes
+  LaneRows blr_;                     // the rows of the lanes' blocks in the current step
+  int batch_rows_ = 0;               // rows of a batched step, at most (batch_row_budget)
   float *bconv_[kMaxLanes] = {}, *bssm_[kMaxLanes] = {};  // their GDN states (replayed in place)
   bf16 *bring_k_[kMaxLanes] = {}, *bring_v_[kMaxLanes] = {};  // their draft context rings
   int32_t *b_pos_ = nullptr, *b_delta_ = nullptr, *b_par_ = nullptr, *b_nc_ = nullptr, *b_budget_ = nullptr;
-  int32_t *b_ids_ = nullptr, *b_blk_ = nullptr, *b_cpath_ = nullptr, *b_pt_ = nullptr;  // [lanes][8] / [lanes][max_pages_]
+  // The step's verify / block ids (packed rows: blr_), the lanes' anchors, commit paths ([lanes][kLaneSlot]), the first
+  // rows of their previous verify (GdnSpec::prow0) and page tables ([lanes][max_pages_]).
+  int32_t *b_ids_ = nullptr, *b_blk_ = nullptr, *b_anchor_ = nullptr, *b_cpath_ = nullptr, *b_prow0_ = nullptr;
+  int32_t* b_pt_ = nullptr;
   uint64_t* b_rng_ = nullptr;        // [lanes][2]
   SpecTree* b_tree_ = nullptr;       // [lanes]
   SpecOut *b_out_ = nullptr, *b_out_dev_ = nullptr;  // [lanes][2] (by step parity), mapped pinned
   struct BatchGraph {
     std::vector<int32_t> lanes;
     int sbuf;
-    AcceptLanes acc;
-    cudaGraphExec_t exec;
+    AcceptLanes acc;  // (acc.lr: the rows of the lanes)
+    cudaGraphExec_t exec;  // (masked lanes: the draft part)
     uint64_t used;
+    cudaGraphExec_t exec2 = nullptr;  // masked lanes: the rest
+    LaneRows lr, lr2;  // the rows exec / exec2 were captured with (other rows: re-captured and updated in place)
   };
   std::vector<BatchGraph> bgraphs_;
   struct LaneRef {  // the host state of a lane's sequence
@@ -315,9 +408,22 @@ class Model {
     int32_t* spec_last;
   };
   LaneRef lane_ref(int z);
+  SpecSampling& lane_smp(int z);  // the sampling of lane z's sequence (its own, not bacc_'s copy)
   void batch_enter(const int32_t* lanes, int n);
   void batch_exit();                 // replays the pending commits, gives the lanes their step scalars back
-  void batch_body(int n);            // one step of the lanes (captured)
+  void batch_body(int n, int part = 0);  // one step of the lanes (captured; part: as spec_body's)
+  bool batch_masked() const;
+  struct BatchGraph;
+  BatchGraph& batch_graph(int n);
+  void batch_prepare(const int32_t* lanes, int n);
+  void batch_rows(int n, int* rows);  // the lanes' rows of a batched step (DSpine)
+  void lane_note(SpecSampling& m, int rows, int tokens) const;
+  bool batch_adapt_ = false;
+  float batch_hyst_ = 0.01f;
+  int batch_period_ = 8;   // batched steps between the decisions (Q27_SPEC_ADAPT_PERIOD)
+  float batch_alpha_ = 0.03125f;  // the lanes' moving averages (Q27_SPEC_ADAPT_BATCH_ALPHA)
+  uint64_t bstep_ = 0;     // batched steps run
+  bool batch_part(int n, int part);
   GdnSpec gdn_spec_lanes(int gdn_layer) const;
   struct Region {
     void* dev;
@@ -328,6 +434,12 @@ class Model {
   void seq_scalars(int32_t* host, bool save);          // device scalars of the running sequence <-> host
   int area_first(int a) const;                         // the first KV page of parking area a
   void reserve_area(int a);                            // moves the KV pages out of area a and takes it
+  void reserve_range(int lo, int hi);                  // moves the KV pages out of [lo, hi) and takes them (KvFull)
+  struct Loan {
+    int lo = 0, hi = 0;                                // KV pages taken
+    std::pair<size_t, size_t> mem;                     // the kv_ pool's bytes released
+  };
+  std::vector<Loan> loans_;                            // (index: loan id; hi == 0: returned)
   void release_area(int a);                            // gives area a's pages to the KV pool
   void seq_take(SeqState& st);                         // the running sequence's host state -> st (none left)
   void seq_give(SeqState& st);                         // st -> the running sequence (after reset / seq_take)
@@ -337,22 +449,22 @@ class Model {
   float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *o_ = nullptr, *n_ = nullptr;
   float *a_ = nullptr, *b_ = nullptr, *g_ = nullptr, *beta_ = nullptr;
   uint8_t *aq_ = nullptr, *asf_ = nullptr;
+  float* ascale_ = nullptr;  // per-token scales of aq_ (FP8 layers with per-channel scales: Weights::dyn8)
   int32_t* ids_ = nullptr;
   float* logits_ = nullptr;
   int32_t* topk_ids_ = nullptr;
   float* topk_logp_ = nullptr;
   float* uniform_ = nullptr;
   int32_t* sampled_ = nullptr;
-  void* ws_ = nullptr;
-  size_t ws_bytes_ = 0;
   bool mlp_bf16_ = true;                              // prefill MLP gate / up in BF16 (Q27_MLP_BF16)
+  bool mlp_fused_ = true;   // prefill MLP gate | up + silu * up + NVFP4 quantization in one GEMM (Q27_MLP_FUSED)
   static constexpr int kSkinnyMaxM = 64;              // decode and verify-sized GEMMs use skinny.cu
   static constexpr size_t kSkinnyWsBytes = 32 << 20;  // split-K partials (up to 64 rows) and counters
   void* skinny_ws_ = nullptr;
   void* attn_ws_ = nullptr;  // split-KV partials of attention_decode
   void* fa_stage_ = nullptr;  // NVFP4 KV: the context rounded to E4M3 for the prefill attention (P7-8)
   size_t fa_stage_bytes_ = 0;
-  bool skinny_ = true;         // Q27_NO_SKINNY=1: CUTLASS for every M (Phase 1 path)
+  bool skinny_ = true;         // Q27_NO_SKINNY=1: the many-row GEMMs for every M (Phase 1 path)
   bool skinny_check_ = false;
   std::string skip_;  // Q27_SKIP (debug timing)
   bool skip(const char* kind) const;
@@ -362,8 +474,13 @@ class Model {
     float temperature;
     int top_k;
     float top_p;
+    float min_p, presence, frequency;
+    int logprobs;
+    bool masked, biased;
     bool operator==(const GraphKey& o) const {
-      return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p;
+      return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && min_p == o.min_p &&
+             presence == o.presence && frequency == o.frequency && logprobs == o.logprobs && masked == o.masked &&
+             biased == o.biased;
     }
   } graph_key_{};
   cudaGraphExec_t graph_exec_ = nullptr;
@@ -371,12 +488,16 @@ class Model {
   // Captured graphs by sampling settings (sequences with different settings take turns, Phase 6); the
   // least recently used one is destroyed beyond kGraphCache. graph_exec_ / spec_graph_ point into them.
   static constexpr int kGraphCache = 4;
+  // Batched steps: an entry per lanes, sampling and total rows (the launches depend on the total; the lanes' split of
+  // it only changes arguments and grids, so a step of other rows updates the entry's graph in place).
+  static constexpr int kBatchGraphCache = 8;
   struct CachedGraph {
     GraphKey key;
     SpecSampling smp;
     int sbuf;
-    cudaGraphExec_t exec;
+    cudaGraphExec_t exec;  // (masked steps: the draft part)
     uint64_t used;
+    cudaGraphExec_t exec2 = nullptr;  // masked steps: the rest
   };
   std::vector<CachedGraph> dgraphs_, sgraphs_;
   uint64_t graph_clock_ = 0;
@@ -409,10 +530,26 @@ class Model {
   KvLayer* kv_layers_dev_ = nullptr;  // device copy of kv_layers_ (KV commit)
   SpecOut *spec_out_ = nullptr, *spec_out_dev_ = nullptr;  // [2] (by step parity), mapped pinned
   int32_t* hist_ = nullptr;   // committed tokens by position (lookup drafting)
+  uint32_t* pen_ = nullptr;   // penalty counts [1 + parking areas][vocab] (pen_counts)
+  BiasList* bias_ = nullptr;  // logit bias lists [1 + parking areas] (bias_list)
+  // Logprobs (SpecSampling::logprobs): mapped pinned results [2] by step parity of the running sequence, [lanes][2]
+  // of a batched step, [1] of the sampler (kLpSample), the raw top lists the penalties would overwrite (scratch,
+  // [verify rows][kMaxTopLogprobs]), and the host copies of the last call's (logprobs()).
+  static constexpr int kLpLanes = 2, kLpSample = 2 + 2 * kMaxLanes;
+  Logprobs *lp_ = nullptr, *lp_dev_ = nullptr;
+  float* lpv_ = nullptr;
+  int32_t* lpi_ = nullptr;
+  Logprobs last_lp_[kMaxLanes] = {};
   uint32_t* lk_best_ = nullptr;
   Lookup lookup_{};           // Q27_LOOKUP (default off), Q27_LOOKUP_MIN, Q27_LOOKUP_AGREE
   int64_t stat_steps_ = 0, stat_lookup_ = 0, stat_tokens_ = 0;
   int spec_paths_ = 1;        // Q27_SPEC_PATHS: draft walks merged into the verify tree (1: chain)
+  // Adaptive verify width (Q27_SPEC_ADAPT*): a single sequence's block between adapt_low_ and the draft's block.
+  bool adapt_on_ = false;
+  int last_block_ = 0;
+  int adapt_low_ = 8;
+  float adapt_up_ = 4.5f, adapt_down_ = 4.0f, adapt_alpha_ = 0.125f;
+  void spec_adapt(SpecSampling& smp, int n) const;
   bool spec_pending_ = false;  // a verify ran since the last flush / reset
   bool spec_pipeline_ = true;  // Q27_SPEC_PIPELINE: launch the next step before reading this one's result
   bool spec_inflight_ = false; // a step launched ahead whose result has not been returned
@@ -424,6 +561,10 @@ class Model {
   SpecSampling spec_key_{};
   SpecSampling spec_smp_{};
   int32_t stop_[2] = {-1, -1};  // generation_config.json eos_token_id
+  uint32_t* mask_host_ = nullptr;  // pinned [kMaskRows][kMaskWords] (mask_rows)
+  uint32_t* mask_dev_ = nullptr;   // the device copy of the rows a step uses
+  int32_t* draft_host_ = nullptr;  // pinned [kMaxLanes][8]: spec_draft's verify tokens
+  bool spec_drafted_ = false;      // spec_draft drafted the step spec_step verifies next
 };
 
 }  // namespace q27

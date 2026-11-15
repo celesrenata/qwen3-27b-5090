@@ -49,8 +49,8 @@ attention layers (every fourth layer). Hidden size 5120, MLP 17408, vocabulary 2
 loops at 2,014 TFLOPS (NVFP4), 1,007 TFLOPS (FP8 as block-scaled `mxf8f6f4`; the plain FP8 MMA with FP32
 accumulation runs at half that rate) and 253 TFLOPS (BF16) (`micro/`). SM120 has the warp-level `mma.sync`
 instructions with block scales, but not the `tcgen05` / TMEM / `wgmma` of data-center Blackwell and Hopper, so
-kernels written for those GPUs do not run; the engine uses CUTLASS's SM120 GEMMs for prefill and its own kernels
-for the rest.
+kernels written for those GPUs do not run; the engine's kernels, prefill GEMMs included, are its own (no CUTLASS
+since P5-12).
 
 At 400 W, compute-bound work runs at the power limit: an FP4 GEMM holds the SM clock at about 1.8 GHz. Prefill
 speed is therefore set by energy per FLOP, which favors the FP4 and FP8 tensor cores over BF16. Decode is
@@ -85,6 +85,14 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 - **No PyTorch in the engine.** The CUDA context and libraries stay small, nothing allocates while serving, and the
   memory plan does not depend on a profiling run. (In the vLLM setup this replaced, the KV cache size varied
   between 4.3 and 6.5 GiB from one start to the next.) PyTorch is used only by the reference model and the tests.
+  The server does not use it either, nor transformers: the tokenizer is `tokenizers` on the checkpoint's
+  `tokenizer.json`, the chat template renders with jinja2 as transformers sets it up, images are
+  resized with PIL and normalized on the GPU, and videos are read and decoded by the engine library itself
+  (NVDEC; `frontend/requirements.txt`; `frontend/tests/test_tokenizer.py` and `test_videoproc.py` compare prompts,
+  ids, image grids and video frames with transformers). The serving image (`Dockerfile`) is therefore 180 MB (a 45 MB
+  download): a distroless base (glibc and libstdc++), the CUDA runtime library, `libq27.so`, Python and those
+  packages (1.21 GB on the nvidia/cuda base image, 456 MB of it the forward-compatibility driver package, which
+  GeForce GPUs do not use; 350 MB on ubuntu:24.04).
 - **The scheduler is Python.** A speculative step takes 12 to 25 ms; the scheduler's decisions take microseconds by
   comparison, and the engine queues the next step before the host reads the previous one ([§6](#6-a-decode-step)).
 
@@ -98,7 +106,7 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 | lm_head | NVFP4 | 0.67 | yes |
 | Embedding | BF16, in pinned host memory | 0 | one row per token |
 | Vision tower | BF16, in pinned host memory (`VISION=host`) | 0 | only for images |
-| DFlash2 draft | NVFP4, quantized at load time | about 1.2 | yes |
+| Draft (DSpine; DFlash2) | NVFP4, quantized at load time (DSpine's code bridge BF16, its codebook in pinned host memory) | about 1.2 | yes |
 
 - **The checkpoint is read as it is**: NVIDIA's NVFP4 checkpoint, or `gdnfp4`, which replaces its GDN projections
   (FP8 in NVIDIA's) with NVFP4 ones quantized by GPTQ from the BF16 original. The loader rearranges the tensors on
@@ -118,7 +126,8 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 
 At startup the engine computes a plan, allocates each pool once and never calls `cudaMalloc` while serving.
 
-- **Budget**: the free VRAM at startup minus `WDDM_MARGIN_GIB` (0.6 GiB), at most 30.3 GiB. If a configuration
+- **Budget**: the free VRAM at startup (with other programs counted: the server passes what NVML sees, since
+  `cudaMemGetInfo` does not count them, on WSL2 or on Windows) minus `WDDM_MARGIN_GIB` (0.6 GiB), at most 30.3 GiB. If a configuration
   does not fit, the engine stops with the breakdown in the log; the server's `MAX_TOKENS_FIT=1` instead lowers
   `MAX_TOKENS` to what fits.
 - **Pools** (separate, no padding to a common page size):
@@ -128,9 +137,9 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   3. The running sequence's state: GDN states (FP32), convolution states, the draft's context ring.
   4. Per-lane buffers of batched steps ([§10](#10-scheduler-and-concurrency)), about 0.25 GiB for eight lanes.
   5. **The KV pool**: everything left, in pages of 64 tokens. With the defaults (`gdnfp4`, NVFP4 KV,
-     `MAX_SEQS=8`, `VISION=host`) it holds 605,504 tokens.
+     `MAX_SEQS=8`, `VISION=host`, DSpine) it holds 601,856 tokens (605,504 with DFlash2).
 - **Parking areas live inside the KV pool.** Each request that is not running keeps its GDN, convolution and
-  draft state (189.6 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
+  draft state (189.9 MiB) in a parking area; there are `MAX_SEQS - 1` of them. While an area is unused, its pages
   hold KV cache like any other page. The KV pool is laid out page-major in blocks (a block holds all 32 slices,
   16 layers x K / V, of G consecutive pages, with G = 57 for NVFP4 so that a slice is at least 2 MiB), so a run of
   consecutive pages is also contiguous memory and a parking area is simply the top N pages of the pool
@@ -139,6 +148,18 @@ At startup the engine computes a plan, allocates each pool once and never calls 
   failing that it raises `KvFull` without changing anything. The kernels see only page numbers: the page table
   holds `(p / G) * 32G + p % G`. As a result, starting with `MAX_SEQS=8` costs only the lanes' buffers, and one
   request still gets the full 262K context.
+- **Video decoding borrows from the KV pool.** NVDEC's decode surfaces are allocated by the driver when a decoder is
+  created, outside the pools: about 0.4 GiB per decoder for 4K 10-bit (0.8 GiB with the two decoders of one
+  video), 0.05 to 0.1 GiB below 1080p. Reserving that at startup would cost every user about 47K tokens of KV
+  cache for a feature few use, and leaving it out of the plan pushes a full process past the point where WDDM
+  starts moving memory to the host. So the KV pool is mapped through CUDA's virtual memory management (32 MiB
+  chunks, the same addresses for its whole life) and, before a video is decoded, the server lends the memory the
+  decode will take: `q27_video_memory` reads the stream's first sequence header with NVDEC's parser alone (on the
+  CPU) and sizes the surfaces, `kv_lend` empties whole blocks just below the parking areas as parking does (pages
+  moved, checkpoints evicted if it must) and unmaps their chunks, and `kv_unlend` maps them again when the decode
+  is done (tens of milliseconds each way; running kernels are not waited for). If the pool cannot spare it, the
+  video is decoded with one decoder and the memory is taken beyond the budget. Without VMM (`Q27_KV_VMM=0`) the
+  pool is one allocation and nothing is lent.
 - **Host memory** (pinned): the embedding table (2.4 GiB), the prefix-cache checkpoints (`STATE_HOST_CACHE`,
   4 GiB), the vision tower (0.9 GiB) and the image embeddings.
 
@@ -181,7 +202,19 @@ request decodes at 96.6 tok/s at a short context.
 
 ## 7. Speculative decoding
 
-The draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
+The default draft is [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16): DFlash2's backbone without the
+convolutions, block-causal, trained with an 8,192-token window (served with 2,048, `Q27_DRAFT_WINDOW`: no fewer accepted
+tokens at a 32K context, shorter steps), and after every layer a code bridge that writes each position's
+predecessor into it. A step drafts up to 15 tokens; the top-16 candidates of each position are scored again with the
+last layer's write redone for every candidate of the predecessor (a 16 x 16 table per position), and the selector
+below walks that table. A sequence verifies 16 rows while its tokens per step stay high and 8 otherwise
+(`Q27_SPEC_ADAPT`). In batched steps each sequence verifies 4, 8, 12 or 16 rows of its own (`Q27_SPEC_ADAPT_BATCH`):
+the rows are packed, the kernels take each lane's first row and count, and every few steps (8) the engine moves one
+lane's rows at a time while that raises the step's expected tokens per ms, from each lane's tokens per step at
+the widths it ran (moving averages; untried widths extrapolated) and a model of the step time (about 11 + 0.18 per lane + 1.1 per 16 rows begun + 0.11 per row ms; the GEMMs step up
+every 16 rows). A new split of the rows updates the step's CUDA graph in place. `SPEC=dflash2` selects DFlash2, described next.
+
+The DFlash2 draft is [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2): five non-causal "block diffusion"
 layers that read the target's hidden states from five layers, attend to the last 2,048 tokens and propose 7 tokens
 in one pass; a low-rank selector chooses among the top-16 candidates at each position. One step drafts 7 tokens
 from an anchor and verifies all 8 rows in one forward of the target.
@@ -201,11 +234,37 @@ from an anchor and verifies all 8 rows in one forward of the target.
   token and layer), and the next step's GDN kernel first replays the accepted tokens onto the state, in the same
   kernel and before its PDL wait. One state slot per request is enough.
 - **Lossless sampling.** Acceptance is rejection sampling against the target's distribution with the request's
-  own temperature, top-k and top-p, so the output has the target's distribution exactly (checked with chi-square
-  tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give identical
-  tokens (`scripts/bench_spec.py --check-greedy`).
+  own temperature, top-k, min-p and top-p, so the output has the target's distribution exactly (checked with
+  chi-square tests in `scripts/spec_sampling_test.py`). With greedy decoding, speculative and plain decoding give
+  identical tokens (`scripts/bench_spec.py --check-greedy`).
+- **Penalties on the device.** Presence and frequency penalties count each sequence's output tokens in a
+  vocabulary-sized array on the device (1 MiB per sequence), updated by the accept step itself, so pipelined
+  steps need no host round trip. A verify row also counts the draft tokens on its own path, so every row sees the
+  history plain decoding would have had, and acceptance stays lossless. The draft's candidate selector takes the
+  same penalties on its proposals (the counts plus the tokens already chosen on the walk), so the drafts follow
+  the penalized target instead of the repetitions the penalties suppress. The penalties are applied to the 64
+  highest logits of a row (one small kernel that re-sorts them), and top-k is taken from those. Requests without
+  penalties run the same kernels and graphs as before (`scripts/penalty_test.py` checks the tokens against a host
+  implementation and speculative against plain decoding).
+- **Logprobs from the verify rows.** With `logprobs` the step also writes, for each token it outputs, the raw
+  log-softmax of the row the token came from (before the temperature, penalties and cuts, as vLLM's default) and
+  that row's top entries (up to 20). A small kernel after the accept step computes the log-sum-exp of the accepted
+  rows only; the top entries come from the sorted lists the sampler takes anyway (a longer list when more are asked
+  for, or a copy made before the penalties re-sort them). The results go to mapped host memory by step parity like
+  the tokens, so pipelined steps do not overwrite them. Requests without logprobs run the same kernels and graphs
+  (`scripts/logprobs_test.py` checks the values against the decode path's log-softmax and speculative against plain
+  decoding, `scripts/batch_test.py check --logprobs` batched lanes against each alone).
+- **Logit bias and `min_tokens` on the device.** A sequence's `logit_bias` is a list of up to 300 (token, value)
+  pairs in device memory (kept with the sequence when it is parked), added to its rows' logits by one small kernel
+  before the grammar mask, top-k and penalties; the whole vocabulary is open to it, so a positive bias can raise a
+  token from anywhere. The same list carries `min_tokens` as a position: a verify row whose token would come before
+  it gets -inf at the end-of-sequence ids, so the ban ends exactly at the right token within a step. The draft's
+  selector adds the bias to its candidates, so banned tokens are not proposed. Requests without them run the same
+  kernels and graphs as before (`scripts/bias_test.py` checks the tokens against a host implementation, speculative
+  against plain decoding, batched lanes against each alone, and `min_tokens` at the exact token).
 - **Stops at EOS and `max_tokens`.** A step never commits tokens past them, so the end of a generation is a clean
-  prefix of the next turn's prompt ([§9](#9-prefix-cache)).
+  prefix of the next turn's prompt ([§9](#9-prefix-cache)). With `ignore_eos` the end-of-sequence ids are ordinary
+  tokens of the step.
 
 Acceptance depends on the text: about 6 tokens per step on JSON, 4.5 to 5 on code, 3.5 on English prose and less
 on Japanese prose (a property of the draft model, also seen in other engines).
@@ -214,10 +273,18 @@ on Japanese prose (a property of the draft model, also seen in other engines).
 
 Prefill runs in chunks of 2,048 tokens through the same weights.
 
-- **GEMMs**: CUTLASS's SM120 block-scaled GEMMs with 128 x 128 x 128 tiles: FP4 for the MLP and the GDN
-  projections, and for FP8 the block-scaled MXFP8 kernel with unit scales (P5-11), which is bit-identical to the
-  plain FP8 GEMM and twice as fast on this GPU. Other tiles and splits made no difference: the GEMMs run at the
-  power limit (P5-3).
+- **GEMMs** (`gemm_mma.cu`, P5-12): the engine's own kernels on `mma.sync` with 128 x 128 tiles, TMA loads into a
+  ring of shared-memory stages filled by a producer warp, 8 MMA warps and TMA stores (or TMA reduce-adds for the
+  residual) in the epilogue. NVFP4 reads the swizzled block scales in place; E4M3 runs the block-scaled MXFP8 MMA
+  with unit scales (P5-11: bit-identical to the plain FP8 MMA and twice as fast on this GPU); BF16 (draft context,
+  vision) any N and K. The MLP's gate | up GEMM writes silu(gate) * up NVFP4-quantized from its epilogue. FP8
+  layers with per-output-channel weight scales and per-token activation scales (unsloth's and Red Hat's
+  checkpoints) take their own instantiation of the fp32 epilogue (acc * weight scale * activation scale), so the
+  other instantiations compile to the same code as before. Results
+  are bit-identical to those of CUTLASS's SM120 kernels, which they replaced: at 400 W they were 2.5-7% faster on
+  most prefill shapes (gdn z 1.8-2.7% and BF16 0.5-1% slower) and the prefill 0.6% / 0.0% faster at 19K / 73K. The K
+  loop keeps its stage arithmetic on the uniform datapath, the producer warp issues its loads from one elected lane
+  without a branch, and the tiles go N fastest unless the weights exceed L2. The GEMMs run at the power limit (P5-3), so instructions and bytes, not stalls, set their speed.
 - **Attention** (`attention.cu`, flash attention on tensor cores, `Q27_ATTN_FP8`):
   - FP8 KV cache (mode 2): Q K^T and P V on FP8 MMAs; K and V as stored, Q with a per-row scale, P scaled by 256
     into E4M3. Exponentials in f16x2 with base 2, masking only on the diagonal chunk (P5-10).
@@ -226,8 +293,8 @@ Prefill runs in chunks of 2,048 tokens through the same weights.
     of context), instead of once per CTA (P7-8).
   - Tiles follow absolute positions (64-token blocks, blocks ending past 1,024 split their keys in two), so a row's
     result does not depend on where a chunk starts.
-- **GDN**: a chunked delta rule with chunks of 64 (WY representation: the per-chunk matrices in FP32 by forward
-  substitution, the inter-chunk state update on BF16 MMAs; P5-2). Chunk boundaries are fixed at multiples of 64
+- **GDN**: a chunked delta rule with chunks of 64 (WY representation: (I + L)^-1 per chunk in FP32 by forward
+  substitution, the inter-chunk state update on BF16 MMAs and delta from (I + L)^-1 on F16 MMAs; P5-2, P5-14). Chunk boundaries are fixed at multiples of 64
   absolute positions, and so are the prefill chunk boundaries and the checkpoints. A prefill resumed from a
   checkpoint is therefore bit-identical to one that ran through.
 - **Draft context**: only the last 2,048 tokens of a prompt go through the draft.
@@ -240,10 +307,13 @@ At 19K tokens prefill runs at 11,295 tok/s; at 194K, 5,875 tok/s, where attentio
 In a hybrid model, attention's KV cache can be reused from any position, but the GDN state exists only where it
 was saved. The cache is therefore a list of **checkpoints**: a token sequence `[0, pos)`, the KV pages that cover
 it (reference-counted, shared between checkpoints of the same conversation) and a copy of the state (GDN in FP32,
-convolution, the draft's context ring: 189.6 MiB).
+convolution, the draft's context ring: 189.9 MiB).
 
 - **Where checkpoints are taken**: at message boundaries the server marks (the end of the first message, which
-  holds the system prompt and tools; the starts of the last message and of the generation prompt), where the prompt diverges from the previous
+  holds the system prompt and tools; the starts of the last message and of the generation prompt), after the last
+  blank line of a final user message (a document followed by a question: a second question about the same document
+  reuses all of it; without this the generation prompt's checkpoint, rounded down to 64, often fell just past the
+  document and the next question resumed from the last interval checkpoint, up to 8,192 tokens back), where the prompt diverges from the previous
   one, every `CHECKPOINT_INTERVAL` (8,192) tokens inside a long prompt (the last four), and at the end of each
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
 - **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 4 GiB = 21 checkpoints). Saving copies the
@@ -253,7 +323,7 @@ convolution, the draft's context ring: 189.6 MiB).
 - **Exactness**: the state is kept in FP32 and the boundaries follow the GDN chunks, so a request resumed from a
   checkpoint produces exactly the tokens it would produce without the cache (`scripts/prefix_cache_test.py`).
 
-An agent's turn after a 20K-token conversation reaches its first token in 0.19 s: everything but the new tool
+An agent's turn after a 20K-token conversation reaches its first token in about 0.2 s: everything but the new tool
 output and user message comes from the cache.
 
 ## 10. Scheduler and concurrency
@@ -293,14 +363,60 @@ takes 47 ms (43 ms with the weights in VRAM, `VISION=bf16`); outputs are bit-ide
 `VISION=fp8` keeps E4M3 weights (per-row scales) in VRAM: 0.43 GiB, slightly less accurate, faster only for small
 images.
 
-- The image processor (resizing, patching) is the checkpoint's own in the server, so the inputs match the
-  reference.
+- The image processor is the checkpoint's own, so the inputs match the reference. The server reads only each
+  image's size from its header (enough for the grid and the token ids) and passes the encoded image on; the engine
+  process decodes and resizes (PIL bicubic, as transformers' PIL backend, on 8 threads with the same pixels as one
+  call) only the images it has to encode, starting while the request waits. A chat client resends the whole
+  history every turn: the images in a cached prefix cost nothing then (a follow-up turn with three 12 MP photos in
+  its history: 1.2 s before, 55 ms). The engine normalizes the resized uint8 RGB ((x - mean) / std in
+  fp32) and arranges the patches (2x2 merge blocks, repeated over the temporal patch) on the GPU, bit-identical to
+  the processor's fp32 `pixel_values` rounded to BF16. A 2048 x 2048 image is 12 MB to send instead of 100 MB of
+  fp32 patches, and the 0.3 s that numpy took for those on the CPU is gone.
 - Image tokens enter the prompt as out-of-vocabulary ids derived from the image's content. The prefix cache, which
   compares token ids, therefore distinguishes images without any change and skips encoding images that are already
   in a cached prefix. The embeddings are written to a pinned host table that the embedding gather reads.
 - M-RoPE: rows of an image get (t, h, w) positions; after the last image, positions continue as position + delta
   (one device integer), so decode and the speculative graphs are unchanged, and text-only requests are
   bit-identical to the text path.
+
+**Videos.** The checkpoint's video processor samples 2 frames per second (4 to 768, an even count), resizes all of
+them to one size and caps the pixels per frame as qwen-vl-utils does (at most 768 tokens per pair of frames, 12,288
+per video; transformers' default from v5.22; `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` raise the bounds of a video).
+Each pair of frames (the temporal patch) is, to the language model,
+an image of its own after its time as text, `<1.3 seconds><|vision_start|>...<|vision_end|>`, with the M-RoPE
+positions of an image (transformers' `get_rope_index` splits a video the same way), so the engine's image path
+takes it unchanged. In the vision tower a pair differs from an image only in that its patches take the two frames
+over the temporal patch instead of one image twice; attention, position embeddings and RoPE stay within the pair.
+
+- The vision tower encodes many pairs of one grid in one pass (attention over each pair's patches: the third
+  grid dimension of the attention kernel), as many as `IMAGE_MAX_PIXELS` holds, so a 5-minute video's 300 pairs
+  take 0.25 s instead of 300 weight streams (about 20 ms each with `VISION=host`). The result is bit-identical to
+  one pair per call.
+- The engine library reads the container itself (`engine/src/video_mp4.cc`: MP4 / MOV, fragmented files and edit
+  lists included; every offset and count checked against the file; `engine/src/video_mkv.cc`: Matroska / WebM on
+  libwebm's `mkvparser`, the frame rate from `DefaultDuration` as libavformat rounds it, else from the frames'
+  timestamps; compressed frames (`ContentEncoding`) are refused) and decodes on NVDEC through the driver's
+  `libnvcuvid` with its bitstream parser (H.264, HEVC, AV1, VP9; 8 or 10 bits; 4:2:0, and 4:2:2 / 4:4:4 where NVDEC
+  decodes them: H.264 and HEVC 4:2:2, HEVC 4:4:4 on an RTX 5090; `engine/src/video_nvdec.cu`). A rotation in the
+  container (an MP4 track's display matrix, Matroska's `ProjectionPoseRoll`, in quarter turns) is applied as FFmpeg
+  applies it: the frames are resized to the turned size and then turned, so a portrait phone video comes upright. No
+  FFmpeg: PyAV's wheel doubled the serving image. The server reads the frame count, rate and size from the header
+  (`q27_video_probe`, no GPU), enough for the plan (the frames, the size, the token ids and the times); the engine
+  process decodes the videos it has to encode while the request waits. Pairs in a cached prefix are not encoded
+  again, nor decoded: the decode starts at the closed key frame before the first pair past the prefix (asking a
+  4K, 60-second video again with a new question decodes 0.24 s instead of 2.5 s).
+- Only the sampled frames leave the decoder: the parser queues four pictures ahead, so decoding overlaps the
+  mapping of a wanted one, which is converted to RGB (BT.601 / 709 / 2020 per the stream, each pixel taking its
+  2x2 block's chroma as FFmpeg's default conversion does, which is what the reference readers give the model) and
+  resized on the GPU in one pass per axis, PIL's bicubic bit for bit (fixed-point weights computed as
+  `libImaging/Resample.c` does). Only the resized frames (at most 75 MB for a video) go to host memory, for the
+  vision tower's input path.
+- One decoding session keeps one NVDEC engine busy (the RTX 5090 has two): a video of 256 frames or more is cut at
+  closed key frames (IDR / BLA, not CRA) into one part per engine, decoded at once; a part that shows another number
+  of frames than its samples (an open GOP after all) makes the video decode again in one part. 60 s at 30 fps,
+  120 frames sampled: 4K AV1 10-bit in 2.65 s (CPU time 1.3 s; FFmpeg on 24 CPU threads: 8.98 s, 43 s of CPU time),
+  4K HEVC 10-bit 2.01 s (6.61 s), 1080p H.264 at 20 Mbit/s 1.01 s (1.28 s). Through the API, the 4K AV1 video
+  (11,954 prompt tokens) answers in 5.7 s.
 
 ## 12. API server
 
@@ -309,11 +425,56 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
 
 - The chat template is the checkpoint's Jinja template; reasoning (`<think>`) and tool calls (Qwen's XML format)
   are parsed by one state machine for streaming and non-streaming responses, and tool calls stream one by one.
+  The state machine splits only at the marker tokens (the detokenizer writes them as private-use characters):
+  the same strings written as ordinary tokens, as the model quotes them in code or in a log it repeats, stay text.
+- Special tokens' strings in what a client writes (system, user and tool messages, tool definitions) stay text:
+  they are marked before the template renders and encoded without the added tokens, so only the template opens
+  and ends turns and places images (`Tokenizer.prompt_ids`; assistant turns, the model's own output, keep theirs).
+- **Forced tool calls** (`tool_choice` naming a tool, or requiring any): the request carries tokens the output must
+  continue with, `<tool_call>\n<function=name>\n` (for any tool, up to `<function`, as `=name` is often one token).
+  Without thinking they follow the prompt at once. With thinking they follow the reasoning: when `</think>` comes
+  out, the scheduler drops the step's tokens after it, turns the sequence's state into a prefix cache checkpoint (as
+  a preemption does) and runs the prompt, the output and the forced tokens as a new prompt. The checkpoint matches
+  when the tokens the step committed past `</think>` were the forced ones (the model was about to call a tool);
+  otherwise the reasoning is computed again from an earlier checkpoint (about 0.1 s per 1,000 tokens). The forced
+  tokens are output tokens (usage, logprobs with logprob 0) and go through the same parser.
+- **Structured output** (`response_format`, Responses `text.format`, vLLM `structured_outputs`, Anthropic
+  `output_config.format`): the server compiles the format to an llguidance grammar (a JSON schema, any JSON object,
+  a regex, a choice or a Lark / GBNF grammar; with tools and `tool_choice: auto`, also tool calls) and the scheduler
+  matches every output token against it, from the start or, with thinking, after `</think>`. A masked sequence's
+  speculative step runs in two parts: the draft (a graph of its own), then the host writes one bitmask per verify row
+  (row i: what the grammar allows after the row's path, the drafted tokens it does not allow leave later rows open),
+  and the verify graph copies them to the device and sets the disallowed logits to -inf before the top-k. The target
+  distribution is the masked one (as vLLM: mask, then temperature, penalties and cuts) and the draft's proposals stay
+  as they were, so the accept step stays lossless; a disallowed draft token is always rejected. No step is launched
+  ahead while masked (that saves 0.07 ms per step); the masks cost about 0.07 ms of CPU per step, and the step about
+  0.35 ms more in all. Sequences without a format run the graphs they ran before; in a batched step only the masked
+  lanes' rows are masked. When the reasoning ends, the step's tokens after `</think>` were sampled without the masks:
+  they stay if the grammar allows them (the engine masks from the next step on), else the sequence restarts from the
+  prefix cache before the first one it does not allow. Logprobs are those of the masked logits.
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
   turn's prompt (and the prefix cache) still has it.
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
+- OpenAI chat completions and completions also return llama.cpp's `timings` object (`cache_n`, `prompt_n`, `prompt_ms`,
+  `predicted_n`, `predicted_ms` and the rates), on the response or the last streamed chunk, which front-ends such as
+  llama-swap read. With a draft, `draft_n` is 7 per verify step and `draft_n_accepted` the step's tokens minus the
+  bonus token, as llama.cpp counts them; they are left out without a draft and with `Q27_SPEC_PATHS` above 1.
 - `/metrics` exposes Prometheus metrics; `/admin/concurrency` reads and sets the admission settings. There is no
   authentication: the server is meant to listen on 127.0.0.1 for one user.
+- `/ui` is a stats page (`frontend/stats.py`, `frontend/ui/index.html`): the engine process sends a snapshot of its
+  requests, KV pool and device memory every 0.5 s while it works and its memory plan once at startup
+  (`q27_memory_report`); the server adds NVML samples and a log of requests and engine events, and streams them to
+  the page as server-sent events. The page (and `POST /admin/engine`) also stops, starts and restarts the engine
+  process: it holds all the VRAM, the server none.
+- Start settings (`frontend/launch.py`): an engine can start with other weights, KV type, draft, vision tower,
+  `MAX_SEQS`, `MAX_TOKENS` or VRAM budget. What each leaves for the context comes from the engine's own memory
+  planner: `q27_plan` runs the constructor's planning (the pools, `MAX_TOKENS_FIT`, the KV pool) for a given free
+  and total device memory and stops before the first CUDA call, so the prediction is the startup log's numbers
+  exactly. A helper process runs the plans, since each sets the environment the engine reads.
+- Loading (`engine/src/prefetch.cc`): the loaders plan the byte ranges they read, `Q27_LOAD_THREADS` threads read
+  them ahead into pinned slots (the embedding straight into its pinned table), and the loaders upload them in plan
+  order as before. The prefix cache's pinned state slots (4 GiB) are allocated after startup, one by one while the
+  engine is idle (`q27_cache_grow`) or when a checkpoint needs one.
 
 ## 13. Correctness
 
@@ -334,12 +495,15 @@ and computes plainly.
   - a verify row equals the decode of the same token (speculative and plain greedy decoding agree),
   - a request in a batch equals the request alone,
   - a prefill resumed from a checkpoint equals the prefill that ran through, at any 64-aligned boundary,
-  - parking, swapping and moving KV pages change nothing,
+  - parking, swapping and moving KV pages change nothing, nor does lending KV pool memory for a video decode
+    (`scripts/lend_test.py`) or mapping the pool through VMM (golden identical with `Q27_KV_VMM=0`),
   - `VISION=host` equals `VISION=bf16`.
 
   One caveat: the skinny GEMM splits K differently for one row than for several (it is faster), so a decode row
   and a verify row of the same token can differ in the last bit. Tests that compare across row counts set
-  `Q27_SKINNY_EXACT=1`; the verify rows of a step and the rows of a batch always use the same split.
+  `Q27_SKINNY_EXACT=1`; the verify rows of a step and the rows of a batch always use the same split. Likewise tree
+  verification (`Q27_SPEC_PATHS` > 1) runs its attention on CUDA cores while decode and chains use tensor cores, so
+  the tests set `Q27_ATTN_TC=0` for trees; with it, greedy trees match plain decoding and the chi-square tests pass.
 - **Speculative sampling** is tested statistically (`scripts/spec_sampling_test.py`): the token frequencies with
   and without speculation agree (chi-square tests over 2,000 samples each).
 - **Quality options** (weights, KV cache type, attention numerics) are judged on the BF16 original's distributions

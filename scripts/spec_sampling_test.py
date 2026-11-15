@@ -9,7 +9,11 @@ token 3, are compared with a chi-square test of homogeneity (categories with sma
 A wrong acceptance rule or residual shows up as tiny p-values; a lossless sampler gives p-values that
 are uniform on (0, 1) across tests.
 
+--min-p, --presence and --frequency test those settings too (the penalties count the first tokens, so tokens 2 and 3
+are penalized when they repeat them, also on the draft path within a step).
+
     docker compose --profile dev run --rm dev python scripts/spec_sampling_test.py --n 2000
+    docker compose --profile dev run --rm dev python scripts/spec_sampling_test.py --n 2000 --min-p 0.05 --presence 1.5 --frequency 0.5
 """
 
 import argparse
@@ -65,22 +69,33 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--presence", type=float, default=0.0)
+    ap.add_argument("--frequency", type=float, default=0.0)
     ap.add_argument("--prompts", default=",".join(PROMPTS))
     ap.add_argument("--out", default="")
+    ap.add_argument("--draft", default="dflash2", choices=["dflash2", "dspine"])
     args = ap.parse_args()
     # Verify rows must be computed like decode rows: by default the skinny GEMMs split K differently for M = 1
     # and M > 1, and with W4A4 that shifts the sampled distributions measurably (e.g. P(first token 'The')
     # 0.35 vs 0.41 for the story prompt), which this test would report as a lossy sampler (2026-10-10).
     os.environ.setdefault("Q27_SKINNY_EXACT", "1")
+    # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
+    # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
+    # So do the 16-row chains of DSpine with BF16 KV (the tensor-core verify takes up to 8 rows there).
+    if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1 or args.draft == "dspine":
+        os.environ.setdefault("Q27_ATTN_TC", "0")
 
     from transformers import AutoTokenizer
 
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, TARGET, snapshot
+    from qwen27b.weights import DFLASH2, DSPINE, TARGET, snapshot
 
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
-    eng = Engine(snapshot(*TARGET), max_tokens=1024, draft=snapshot(*DFLASH2))
+    eng = Engine(snapshot(*TARGET), max_tokens=1024, draft=snapshot(*(DSPINE if args.draft == "dspine" else DFLASH2)))
     smp = (args.temperature, args.top_k, args.top_p)
+    more = dict(min_p=args.min_p, presence=args.presence, frequency=args.frequency)
+    pen = bool(args.presence or args.frequency)
     report = {"args": vars(args), "tests": []}
     for name in args.prompts.split(","):
         ids = tok.apply_chat_template([{"role": "user", "content": PROMPTS[name]}], add_generation_prompt=True,
@@ -92,12 +107,16 @@ def main():
             rng = random.Random(1000003 * s + 7)
             u1, u2, u3 = rng.random(), rng.random(), rng.random()
             eng.reset()
-            a1 = eng.forward_sample(ids, *smp, u1)
-            a2 = eng.forward_sample([a1], *smp, u2)
-            a3 = eng.forward_sample([a2], *smp, u3)
+            if pen:
+                eng.penalty_init([])
+            a1 = eng.forward_sample(ids, *smp, u1, **more)
+            a2 = eng.forward_sample([a1], *smp, u2, **more)
+            a3 = eng.forward_sample([a2], *smp, u3, **more)
             plain.append((a1, a2, a3))
             eng.reset()
-            b = [eng.spec_begin(ids, *smp, seed=s * 7919 + 1, uniform=u1)]
+            if pen:
+                eng.penalty_init([])
+            b = [eng.spec_begin(ids, *smp, seed=s * 7919 + 1, uniform=u1, **more)]
             first = eng.spec_step()
             accepted += len(first) - 1
             b += first

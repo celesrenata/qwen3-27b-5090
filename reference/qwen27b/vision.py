@@ -24,6 +24,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from .image_tokens import VOCAB, ImageSpan, expand_image_pads, image_token_ids  # noqa: F401
+
 VIS = "model.visual"
 
 
@@ -54,6 +56,17 @@ class VisionConfig:
     @property
     def patch_dim(self) -> int:
         return self.in_channels * self.temporal_patch * self.patch * self.patch
+
+
+def patchify(rgb: torch.Tensor, mean, std, patch: int = 16, merge: int = 2, temporal: int = 2):
+    """The image processor's pixel_values [gh * gw, 3 * temporal * patch * patch] fp32 of a resized image
+    (rgb [H, W, 3] uint8, H and W multiples of patch * merge): (x - mean) / std per channel in fp32, patches in
+    2x2 merge-block order, each repeated over the temporal patch."""
+    x = (rgb.permute(2, 0, 1).float() - torch.tensor(mean)[:, None, None]) / torch.tensor(std)[:, None, None]
+    c, gh, gw = x.shape[0], x.shape[1] // patch, x.shape[2] // patch
+    x = x.reshape(c, gh // merge, merge, patch, gw // merge, merge, patch).permute(1, 4, 2, 5, 0, 3, 6)
+    x = x[:, :, :, :, :, None].expand(*x.shape[:5], temporal, patch, patch)
+    return x.reshape(gh * gw, c * temporal * patch * patch).contiguous()
 
 
 def patch_coords(gh: int, gw: int, merge: int = 2):
@@ -178,20 +191,6 @@ class VisionReference:
 # ---------------------------------------------------------------- multimodal positions (M-RoPE)
 
 
-@dataclass
-class ImageSpan:
-    """One image in a token sequence: `<|image_pad|>` x (gh * gw) at positions start .. start + gh*gw - 1,
-    with the merged grid gh x gw (patch grid / 2)."""
-
-    start: int
-    gh: int
-    gw: int
-
-    @property
-    def length(self) -> int:
-        return self.gh * self.gw
-
-
 def mrope_positions(n: int, spans: list) -> tuple[torch.Tensor, int]:
     """Positions [3, n] (t, h, w) of a sequence of n tokens with images at `spans`, and the final delta
     (position of the next token = n + delta), as transformers' get_rope_index."""
@@ -224,34 +223,3 @@ def mrope_cos_sin(pos3: torch.Tensor, rotary_dim: int, theta: float, device, sec
     freqs = p[axis].T * inv_freq[None, :]  # [T, half]
     emb = torch.cat((freqs, freqs), -1)
     return emb.cos(), emb.sin()
-
-
-def expand_image_pads(ids, grids, pad_id: int, merge: int = 2, fill=None):
-    """Expand each single `<|image_pad|>` of a templated prompt (one per image, in order) to the image's
-    merged token count. grids: [(1, gh, gw)] patch grids from the processor. fill(i, n) gives the n ids of
-    image i (default: the pad id n times). Returns (ids, [ImageSpan])."""
-    out, spans, k = [], [], 0
-    for t in ids:
-        if t != pad_id:
-            out.append(t)
-            continue
-        _, gh, gw = (int(v) for v in grids[k])
-        sp = ImageSpan(len(out), gh // merge, gw // merge)
-        out.extend(fill(k, sp.length) if fill else [pad_id] * sp.length)
-        spans.append(sp)
-        k += 1
-    assert k == len(grids), f"{k} image pads for {len(grids)} images"
-    return out, spans
-
-
-VOCAB = 248320
-
-
-def image_token_ids(key: bytes, n: int) -> list:
-    """The n prompt ids of an image (P4-12): out-of-vocabulary ids derived from the image's content, so that
-    the engine's prefix cache matches a prompt only where the same images sit at the same positions."""
-    import hashlib
-
-    h = int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
-    span = 2**31 - 1 - VOCAB
-    return [VOCAB + (h + j) % span for j in range(n)]

@@ -7,29 +7,36 @@ Anthropic-compatible APIs with images, so coding agents such as Claude Code and 
 It is not a general engine: the kernels, the memory plan and the scheduler are written for this one model on this one
 GPU. That buys two things:
 
-- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–2.8x the
-  single-request decode, 1.1–1.7x the throughput of eight concurrent requests, and a 152K-token prompt answered in
-  23 s instead of 31–56 s.
-- **The full 262K context with room to spare.** A 605K-token KV cache on a 32 GB card, 2.8–6.3x what the other
+- **Speed.** Faster than [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [NInfer](https://github.com/Neroued/ninfer) on the same card in every scenario measured: 1.3–3.7x the
+  single-request decode, 1.02–1.6x the throughput of eight concurrent requests, and a 152K-token prompt answered in
+  22 s instead of 31–56 s.
+- **The full 262K context with room to spare.** A 602K-token KV cache on a 32 GB card, 2.8–6.3x what the other
   engines fit, with up to eight requests, images and speculative decoding all enabled at once. Of the others, only
   NInfer reached the model's whole 262,144-token context here, serving one request without speculative decoding.
 
-All numbers are measured at a **400 W power limit** (the card's default is 575 W), on the same day, driver and scripts
-for every engine. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
-commands that reproduce them.
+All numbers are measured at a **400 W power limit** (the card's default is 575 W) with the same scripts: the other
+engines on 2026-10-11, this engine with its current default draft (DSpine) on 2026-11-13; the same-day numbers with
+the previous default are in the benchmarks too. [docs/benchmarks.md](docs/benchmarks.md) has the conditions, each engine's settings and the
+commands that reproduce them. At 575 W the engine is only 1–2% faster for one request and 9–26% faster for prefill
+and eight concurrent requests, while 400 W gives 8–29% more tokens per joule
+([Power limit and energy](docs/benchmarks.md#power-limit-and-energy)).
 
 ## Fast
 
 | On one RTX 5090 at 400 W | This engine | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: |
-| Decode, one request: code / JSON / prose (tok/s) | **386 / 500 / 258** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
-| Eight concurrent requests, total (tok/s) | **1,395** | 1,260–1,277 | 837–851 | 912–930 |
-| Time to first token, 152K-token document | **23 s** | 31 s | 50 s | 56 s |
-| Time to first token, agent turn after a 20K-token history | **0.19 s** | 0.39 s | 0.31 s | 0.57 s |
-| Follow-up question on a 73K-token document | **0.14 s** | 10.9 s | 0.49 s | 1.01 s |
+| Decode, one request: code / JSON / prose (tok/s) | **410 / 674 / 263** | 285 / 362 / 197 | 246 / 320 / 167 | 154 / 180 / 128 |
+| Eight concurrent requests, total (tok/s) | **1,305** (1,392 with `SPEC=dflash2`) | 1,260–1,277 | 837–851 | 912–930 |
+| Time to first token, 152K-token document | **22 s** | 31 s | 50 s | 56 s |
+| Time to first token, agent turn after a 20K-token history | **0.22 s** | 0.39 s | 0.31 s | 0.57 s |
+| Follow-up question on a 73K-token document | **0.12 s** | 10.9 s | 0.49 s | 1.01 s |
 
-- **Speculative decoding** with the [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) block drafter,
-  batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+- **Speculative decoding** with the [DSpine](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) block drafter (blocks of up to
+  16 tokens, the verify width adapting to the acceptance; [DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) with
+  `SPEC=dflash2`), batched across concurrent requests; each request's tokens are bit-identical to running it alone.
+  DSpine is faster for one request (JSON 1.37x, code 1.08x). In a batch each DSpine request verifies 4 to 16 rows of
+  its own, chosen from its recent acceptance; on long reasoning DFlash2 is still 3–6% faster with four or eight
+  requests at once, so a server that mostly runs many such requests may prefer `SPEC=dflash2`.
 - **NVFP4 weights including the Gated DeltaNet projections**
   ([juzbox/Qwen3.8-27B-NVFP4-GDN](https://huggingface.co/juzbox/Qwen3.8-27B-NVFP4-GDN), GPTQ from the BF16 original;
   the attention projections stay FP8 because quantizing them cost parallel tool calls): decode reads 14 GiB of
@@ -41,9 +48,9 @@ commands that reproduce them.
 
 | | This engine | NInfer | SGLang | vLLM |
 | --- | ---: | ---: | ---: | ---: |
-| KV cache (tokens) | **605,504** | 96,128 | 214,219 | 173,913 |
+| KV cache (tokens) | **601,856** | 96,128 | 214,219 | 173,913 |
 | Longest context of one request | **262,144** (the model's limit) | 94,208 | 196,608 | 160,000 |
-| ... at the same time as | 8 concurrent requests, images, DFlash2 | 4 requests | 4 requests, MTP | 8 requests, MTP |
+| ... at the same time as | 8 concurrent requests, images, DSpine | 4 requests | 4 requests, MTP | 8 requests, MTP |
 
 The other engines' columns are the largest settings with concurrency and speculative decoding that ran on this
 machine; NInfer and SGLang need other configurations for other scenarios (NInfer: 262K for one request without
@@ -70,7 +77,7 @@ Long prompts stay fast and accurate:
 | 73K tokens | 8,773 tok/s (8.3 s) | 87 tok/s |
 | 194K tokens | 5,875 tok/s (33 s) | 77 tok/s |
 
-Between 73K and 152K tokens of a prompt this engine prefills 5,359 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
+Between 73K and 152K tokens of a prompt this engine prefills 5,652 tok/s, against 3,868 (NInfer), 2,234 (SGLang)
 and 1,953 (vLLM). Needle retrieval finds 16 of 16 facts at 190K tokens and 56 of 64 at 256K.
 
 The full measurements, each engine's settings and the caveats (NInfer's memory sizing under WSL2, for one) are in
@@ -81,16 +88,21 @@ options that were tried and dropped. Task IDs in code comments (such as `P7-8`) 
 ## Requirements
 
 - An RTX 5090 (other GPUs are not supported: the kernels use SM120 block-scaled MMAs and are tuned for its 32 GB).
-- Linux or WSL2 with a recent NVIDIA driver, Docker with the NVIDIA Container Toolkit.
-- About 25 GB of disk for the weights and 20 GB for the build image. At least 16 GB of host RAM: the engine pins
-  about 8 GB (the embedding table, the prefix cache, the vision tower).
-- [uv](https://docs.astral.sh/uv/) on the host to download the weights.
+- A recent NVIDIA driver for CUDA 13 (tested with 617.42), and one of:
+  - **Linux or WSL2** with Docker and the NVIDIA Container Toolkit, or
+  - **Windows** (64-bit, native): nothing else, the [Windows package](#windows-native) brings its own Python.
+- About 25 GB of disk for the weights; 180 MB for the serving image (a 45 MB download) or 28 MB for the Windows package (the development
+  image, for the tests and benchmarks, is 20 GB). At least 16 GB of host RAM: the engine pins about 8 GB (the
+  embedding table, the prefix cache, the vision tower).
+- To download the weights on Linux: Python 3.10+ (standard library only) or [uv](https://docs.astral.sh/uv/) for
+  `scripts/download-weights.sh`. An interrupted download resumes when the command is run again.
 
 ## Quick start
 
 ```bash
 scripts/download-weights.sh                 # gdnfp4 weights and the draft model into ./hf (23 GB)
-docker compose up -d serve                  # builds the engine on first start, then serves 127.0.0.1:8000
+docker compose pull serve                   # the serving image from ghcr.io (45 MB download)
+docker compose up -d serve                  # serves 127.0.0.1:8000
 docker compose logs -f serve                # wait for "engine ready"; the log shows the memory plan
 ```
 
@@ -100,6 +112,111 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 ```
 
 `./hf` can be a symlink if the weights should live on another disk.
+
+To get a newer version later, see [Updating](#updating).
+
+The serving image ([Dockerfile](Dockerfile), published by [a workflow](.github/workflows/image.yml)) compiles the
+engine in the CUDA devel image and keeps only the result on a distroless base (glibc and libstdc++): the CUDA runtime library (the driver comes
+from the NVIDIA Container Toolkit), `libq27.so`, Python and the server's three packages (`frontend/requirements.txt`:
+tokenizers, jinja2, pillow). No compiler, PyTorch or transformers. `docker compose up -d --build serve` builds it from the checkout instead (about 2 minutes the first
+time, then only the engine sources that changed), e.g. after changing the code.
+
+`scripts/serve.sh up` does the same and waits until the server answers (`up --idle`: the server only, no VRAM until
+the engine is started at `/ui`; `up --build`; `update`: pull first; `down`, `status`). From Windows, double-click
+`\\wsl.localhost\<distro>\<path to the checkout>\scripts\windows\serve.cmd`, or put a shortcut to it on the desktop
+or in `shell:startup` (`serve.cmd idle` there, to start with the logon without taking the GPU). It starts the
+container in the WSL distro the checkout is in, opens the stats page, and keeps the distro running while the
+container runs (WSL shuts an idle distro down, and Docker with it).
+
+### Updating
+
+Docker keeps using the image it already has until you ask for a newer one: `docker compose up -d serve` or
+`docker compose restart serve` alone does not update anything. Run these in the folder of the checkout:
+
+```bash
+git pull                      # the newest compose.yaml and scripts
+docker compose pull serve     # download the newest image (45 MB at most)
+docker compose up -d serve    # replace the running container with one from the new image
+docker compose logs -f serve  # wait for "engine ready", then Ctrl+C (the server keeps running)
+```
+
+`scripts/serve.sh update` does the last three steps in one and returns once the server answers; the engine may still be
+loading then (`/health` turns 200 when it is ready). From Windows, run `serve.cmd update` the same way. Run `git pull`
+first in either case.
+
+- **What to expect:** the weights in `./hf` stay where they are and are not downloaded again. Replacing the container
+  ends the requests in progress and reloads the engine.
+  Updating from a version before DSpine became the default draft: run `scripts/download-weights.sh` to add it (4.1 GB);
+  until then the server keeps using DFlash2 and says so in its log.
+- **Which version is running:** this prints the commit of the image you have, to compare with the
+  [commits](https://github.com/mkyt/qwen3-27b-5090/commits/main). (The output is empty for an image built here with
+  `--build`.)
+
+  ```bash
+  docker image inspect ghcr.io/mkyt/qwen3-27b-5090:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+  ```
+
+- **Where the image comes from:** from v0.5.0, every image that GitHub Actions publishes carries a signed build
+  provenance attestation, which the [GitHub CLI](https://cli.github.com/) checks against this repository (it prints
+  the workflow and commit that built it):
+
+  ```bash
+  gh attestation verify oci://ghcr.io/mkyt/qwen3-27b-5090:latest --repo mkyt/qwen3-27b-5090
+  ```
+
+- **Going back to another version:** set `SERVE_TAG` to a release version or `sha-<commit>` (the
+  [package](https://github.com/mkyt/qwen3-27b-5090/pkgs/container/qwen3-27b-5090) lists them) on both commands. It only
+  applies to the command it is on, so a later `docker compose up -d serve` without it uses `latest` again.
+
+  ```bash
+  SERVE_TAG=0.1.0 docker compose pull serve
+  SERVE_TAG=0.1.0 docker compose up -d serve
+  ```
+
+- **Freeing disk space:** each update leaves the previous image behind, without a name.
+  `docker image prune` deletes such images, including those of other projects, and asks first.
+
+The [Windows package](#windows-native) has no image: run `update.cmd` in its folder (from v0.3.1), which downloads the
+latest [release](https://github.com/mkyt/qwen3-27b-5090/releases), quits the tray app and replaces the program. The
+settings and the weights stay ([docs/configuration.md](docs/configuration.md#updating), also by hand).
+
+### Windows (native)
+
+The same engine and server also run on Windows itself, without WSL2 or Docker, and as fast: decode measured
+326.6 / 1,393 tok/s (one / eight requests) natively against 325.4 / 1,386 under WSL2 on the same day, and the output
+is bit-identical to Linux on the golden set. The package, `qwen3-27b-5090-<version>-windows-x64.zip` (28 MB,
+attached to the [releases](https://github.com/mkyt/qwen3-27b-5090/releases) from the first versioned one;
+`scripts/windows/package.ps1` builds it from a checkout), holds `q27.dll`, the embeddable Python from python.org with the server's packages, and
+the tray app `qwen3-27b-tray.exe`, `start.cmd` and `update.cmd`. It needs no VC++ redistributable, CUDA toolkit or administrator rights.
+
+Unzip it anywhere and run `qwen3-27b-tray.exe`: an icon appears in the notification area, its color and tooltip show
+the state, and its menu starts and stops the server, changes its settings, opens the stats page and the log, and sets
+the start at logon. The
+server then takes no VRAM until the first request and frees it after 30 minutes without one
+([docs/configuration.md](docs/configuration.md#tray-app)). The program is not signed, so Windows may warn about it at the
+first start. To check the download, compare the zip's SHA-256 with the release's, or, from v0.5.0, check its signed
+build provenance with the [GitHub CLI](https://cli.github.com/): `gh attestation verify
+qwen3-27b-5090-v0.5.0-windows-x64.zip --repo mkyt/qwen3-27b-5090` (also for `qwen3-27b-tray.exe` and
+`app\engine\build\q27.dll` in it).
+
+Or run `start.cmd`, which keeps the server in a console window and loads the engine at once. The first start downloads
+the weights (23 GB, into the folder; an interrupted download resumes), then the server listens on http://127.0.0.1:8000
+and the browser opens its stats page.
+
+The package is portable: its settings (`settings.ini`, see `settings.example.ini`), weights and log stay in its folder, so
+it needs one you can write to. Versions before the tray app downloaded the weights to
+`%USERPROFILE%\.cache\huggingface`: set `HF_HOME` there in `settings.ini` to use them instead of downloading again
+([docs/configuration.md](docs/configuration.md#windows-package)). Reading the weights from a Windows disk is also
+faster natively (about 5.8 GB/s against 2.6–2.8 GB/s from WSL2's `/mnt`).
+
+### Stats page
+
+http://127.0.0.1:8000/ui shows the server live: GPU utilization and power, VRAM by owner (weights, KV cache, state,
+activations, CUDA runtime), each running request's context and prefill / decode speed, and a log of the requests
+with their prefix-cache hits. The page also stops the engine to free the VRAM (the server stays up) and starts or
+restarts it with other settings (weights, KV cache type, speculative decoding, vision tower, requests at once,
+context limit, VRAM budget), showing for every choice the context it leaves before anything is loaded
+([docs/configuration.md](docs/configuration.md#start-settings)).
 
 ## Clients
 
@@ -111,25 +228,96 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   `CLAUDE_CODE_MAX_CONTEXT_TOKENS=262144`.
 - **Codex** (Responses API): a provider with `base_url = "http://127.0.0.1:8000/v1"` and `wire_api = "responses"`.
 - Send the previous turns' reasoning back: the chat template renders it, and the prefix cache only hits when it is there.
-- Images as data URLs or http(s) URLs. No video.
+- Images and videos as data URLs or http(s) URLs: `image_url` parts, and `video_url` parts as vLLM takes them
+  (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`; up to 256 MB): MP4 / MOV or Matroska / WebM
+  with H.264, HEVC, AV1 or VP9 (4:2:0; H.264 and HEVC also 4:2:2, HEVC 4:4:4; 8 or 10 bits), decoded on the GPU's
+  video decoder (NVDEC); a phone video's rotation is applied. A video is sampled
+  at 2 frames per second (4 to 768 frames) and costs at most 12,288 tokens, as the checkpoint's processor does it
+  with qwen-vl-utils' per-frame cap; the model sees each second's pair of frames with its time
+  ([Images and videos](docs/architecture.md#11-vision-tower)). A request can sample otherwise with vLLM's
+  `"mm_processor_kwargs": {"fps": 1}` (or `num_frames`, `min_frames`, `max_frames`, and `"size": {"longest_edge": N}`,
+  the pixels of all frames together: 2,048 per token). For long videos the server can take more:
+  `VIDEO_MAX_TOKENS` and `VIDEO_MAX_FRAMES` ([Long videos](docs/configuration.md#long-videos)).
+- Special tokens written in messages (e.g. `<|im_start|>` in a pasted file or a tool result) are read as text, not as
+  turn markers. `/v1/completions` takes them as tokens.
 
-Accepted but without effect: `response_format`, the penalties, `min_p`, `tool_choice` other than `auto` / `none`.
-`n > 1` and `logprobs` are rejected.
+Sampling: `temperature`, `top_k`, `top_p`, `min_p`, `presence_penalty` and `frequency_penalty` (OpenAI's, -2 to 2;
+the model card suggests `presence_penalty` 1.5 for non-thinking use), and `seed`. The penalties apply to the 64 most
+likely tokens of each step. Chat completions and completions also take OpenAI's `logit_bias` (token id to -100..100, up
+to 300 entries; added to the logits before everything else) and vLLM's `min_tokens` (no end of sequence before that
+many tokens) and `ignore_eos` (generate to `max_tokens`; the end-of-sequence tokens count but their text is left out).
+Accepted but without effect: `repetition_penalty`. `n > 1` is rejected.
+
+Structured output: the output follows a JSON schema, any JSON object, a regex, a choice or a grammar, by masking the
+tokens the format does not allow at each step: OpenAI chat `response_format` (`json_object`, `json_schema`; enforced
+whether or not `strict` is set), the Responses API's `text.format`, vLLM's `structured_outputs` (`json`, `regex`,
+`choice`, `grammar` in Lark or GBNF; chat and completions) and Anthropic's `output_config.format` (or
+`output_format`). With thinking on, the format applies after the reasoning; with tools and `tool_choice: auto` the
+model may call a tool instead. A format that cannot be compiled is a 400. Grammars by
+[llguidance](https://github.com/guidance-ai/llguidance); a speculative step then costs about 0.35 ms (2.5%) more.
+
+Tool choice: `tool_choice` forces a call in all three APIs: a named tool (OpenAI `{"type": "function", ...}`, Anthropic
+`{"type": "tool", "name": ...}`) gives one call of it, any tool (`required`, Anthropic `any`) at least one call. The
+server writes the start of the call into the answer (after the reasoning, with thinking on) and the model writes the
+arguments; they are not checked against the tool's schema. Responses `allowed_tools` is taken as its `mode` alone.
+
+Logprobs: chat completions take `logprobs: true` and `top_logprobs` (0 to 20), completions `logprobs` (0 to 20), the
+Responses API `include: ["message.output_text.logprobs"]` and `top_logprobs` (0 to 20), also when streaming. The values
+are the model's raw log-probabilities (before the temperature, penalties and top-k / top-p, as vLLM's default
+`raw_logprobs`; a `logit_bias` is included, as in OpenAI's API). As in vLLM, chat's `logprobs.content` covers every
+generated token, the reasoning and tool calls included; the Responses API's `output_text.logprobs` covers the tokens of
+the message's text only. Tokens of a stop string that ends the text are left out. `bytes` holds a token's own UTF-8
+bytes, which can end inside a character (its `token` then shows U+FFFD). Not for the Anthropic API.
 
 ## Configuration
 
-The `serve` service reads its settings from the environment (or `.env`); the most useful ones:
+Settings are variables with the same names everywhere: in `.env` (or the shell) with Docker, in `settings.ini` in the
+Windows package. [How settings work](docs/configuration.md#how-settings-work) says where each one goes and what it takes
+to change it. The most useful ones:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MAX_TOKENS` | 262144 | Context limit of one request |
 | `MAX_SEQS` | 8 | Requests that can run at once (1–8); how many actually run is decided while running, from the free KV cache |
 | `KV_DTYPE` | `nvfp4` | `nvfp4`, `fp8` or `bf16` |
-| `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, or a model directory |
-| `SPEC` | `dflash2` | `dflash2` or `none` |
+| `WEIGHTS` | `gdnfp4` | `gdnfp4`, `nvidia` (NVIDIA's checkpoint as is), `quasar`, another checkpoint of the model on the Hugging Face Hub (`ORG/NAME[@REVISION]`, [below](#other-checkpoints)), or a model directory |
+| `SPEC` | `dspine` | `dspine`, `dflash2` or `none` |
 | `VISION` | `host` | `host`, `fp8`, `bf16` (vision tower placement) or `off` |
 
-[docs/configuration.md](docs/configuration.md) lists every setting.
+[docs/configuration.md](docs/configuration.md) lists every setting. By default the server accepts connections from this PC
+only; [Using it from other machines](docs/configuration.md#using-it-from-other-machines) says how to open it to your network.
+
+### Other checkpoints
+
+Fine-tunes of Qwen3.8-27B published in NVFP4 load as well, when they are quantized like NVIDIA's checkpoint
+(modelopt), QUASAR (compressed-tensors) with 4-bit activations, or unsloth's and Red Hat's mixed-precision
+checkpoints (FP8 layers with per-channel scales and per-token activations), for example
+[ukisai/Swift-1.5-Qwen3.8-27b-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-NVFP4):
+
+```bash
+python3 scripts/download_weights.py --weights ukisai/Swift-1.5-Qwen3.8-27b-NVFP4   # (HF_HOME=hf for the compose services)
+WEIGHTS=ukisai/Swift-1.5-Qwen3.8-27b-NVFP4 docker compose up -d serve
+```
+
+Before downloading, the script runs the engine's own checks on the checkpoint's safetensors headers (a few hundred
+KB), so a checkpoint it cannot serve (weight-only NVFP4A16, mixed precisions, GGUF, other engines' formats) is
+refused with the tensor at fault rather than after 20 GB. The checks need the engine library: they run in the
+Windows package and in the `dev` container (`docker compose --profile dev run --rm dev-cpu python
+scripts/download_weights.py ...`, which writes to `./hf`), and are skipped with a note from a plain host Python. A
+BF16 `lm_head` is quantized to NVFP4 at load. Downloaded checkpoints also appear among the start settings of the
+stats page and `POST /admin/engine`, if their tokenizer has the server's vocabulary; prompts are then rendered with
+their own chat template.
+
+Swift-1.5 passes the API and image tests. The DFlash2 draft, trained on the original model, keeps its acceptance on
+it (4.13 tokens per verify step against 4.10 with gdnfp4); it decodes 298 / 1,300–1,324 tok/s (one / eight requests)
+against 322 / 1,389 with gdnfp4 on the same server, as its GDN projections are FP8 like NVIDIA's checkpoint. Quality
+is the fine-tune's own: it is not compared with a reference here.
+
+[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) is a quantization of the model itself
+with its own chat template. On the golden prompts its KL to the BF16 model is
+0.0258 (top-1 agreement 90.95%), against 0.0381 for NVIDIA's checkpoint and 0.0454 for gdnfp4, at 21.65 GB of
+weights (KV pool 393,920 tokens) and 289–291 / 1,299–1,310 tok/s (one / eight requests; gdnfp4 322 / 1,383–1,396 on
+the same build).
 
 ## Correctness and quality
 
@@ -154,7 +342,9 @@ with), with an FP8 KV cache (`ref-gpu-kvfp8`, the noise floor), the BF16 origina
 
 ## Tests
 
-The `dev` image builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. Unit tests:
+The `dev` image (dev/Dockerfile: the CUDA toolkit, PyTorch) builds the engine and runs the tests; `dev-cpu` is the same image without the GPU. Every kernel is the engine's own, the prefill GEMMs included (`engine/src/gemm_mma.cu`, on
+`mma.sync` and TMA; they replaced CUTLASS's SM120 kernels with bit-identical results), so the engine has no
+dependency beyond the CUDA toolkit. Unit tests:
 
 ```bash
 docker compose --profile dev run --rm dev-cpu python -m pytest -q frontend/tests                # server: parsing, admission (seconds)
@@ -162,12 +352,12 @@ docker compose --profile dev run --rm dev-cpu bash -c 'cd reference && pytest -q
 docker compose --profile dev run --rm dev bash -c 'cmake -S engine -B /build/engine -G Ninja && cmake --build /build/engine && cd engine/tests && python -m pytest -q'   # kernels against PyTorch (GPU, about 3 min)
 ```
 
-End-to-end checks against a running server (`docker compose up -d serve`), from the host (standard library only):
+End-to-end checks against a running server (`docker compose up -d serve`; `--build` to test a change), from the host (standard library only):
 
 ```bash
 python3 scripts/smoke_test.py                # a few requests
 python3 scripts/api_test.py                  # OpenAI / Anthropic APIs: streaming, tool calls, reasoning
-python3 scripts/vision_api_test.py           # images
+python3 scripts/vision_api_test.py           # images and videos
 ```
 
 The integration tests under `scripts/` (`decode_consistency.py`, `multiseq_test.py`, `prefix_cache_test.py`,
@@ -179,17 +369,21 @@ The integration tests under `scripts/` (`decode_consistency.py`, `multiseq_test.
 engine/       the engine: CUDA kernels, model runner, speculative decoding, prefix cache, vision tower, C API
 frontend/     the HTTP server (OpenAI / Anthropic APIs, chat template, tool-call parsing, scheduler)
 reference/    PyTorch reference model, golden recordings
-scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4
+scripts/      weight download, end-to-end tests, benchmarks, quality evaluations, building gdnfp4;
+              windows/: the Windows package (package.ps1, start.cmd) and serve.cmd for WSL2
+windows/tray/ the tray app of the Windows package (Win32, C++)
 tools/        memory plan / roofline calculator, draft vocabulary builder
 micro/        microbenchmarks of the GPU (bandwidth, MMA peaks, PCIe)
-dev/          the build image (CUDA, CUTLASS, PyTorch for the reference)
+Dockerfile    the serving image (libq27.so, the server and three Python packages; 180 MB, ghcr.io/mkyt/qwen3-27b-5090)
+dev/          the development image (CUDA, PyTorch for the reference and the tests)
 bench/        golden prompts, draft vocabulary, test images
 docs/         architecture, decisions, configuration, benchmarks
 ```
 
 ## License
 
-MIT ([LICENSE](LICENSE)). The build image fetches [CUTLASS](https://github.com/NVIDIA/cutlass) (BSD-3-Clause); the
-model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
-not distributed here. The golden prompt texts are public domain or from this repository
+MIT ([LICENSE](LICENSE)). The
+model weights (Qwen3.8-27B, NVIDIA's NVFP4 checkpoint, DSpine, DFlash2, the gdnfp4 build) are Apache-2.0 and are downloaded,
+not distributed here; other checkpoints carry their own licenses. The Windows package also contains Python and its
+packages under their own licenses (in the package). The golden prompt texts are public domain or from this repository
 ([bench/golden/sources/README.md](bench/golden/sources/README.md)).

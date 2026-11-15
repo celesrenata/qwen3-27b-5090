@@ -23,12 +23,16 @@ for each number of requests decoding together). With nothing running, the first 
 starts. A request waiting for room rather than one suspended later keeps its turn and its KV.
 
 Messages (pickled tuples). In: ("submit", rid, request), ("cancel", rid), ("config", changes, n), ("stop",).
-Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids]), ("done", rid, finish, info),
-("error", rid, message), ("metrics", dict), ("config", settings, n: the change answered, or None).
+Out: ("ready", info), ("start", rid, info), ("tok", rid, [ids][, logprobs: per id (logprob, [(id, logprob)])]), ("done", rid, finish, info),
+("prefilled", rid, info: the prompt side of "done"'s info after a prefill ends, for a request a stop string ends),
+("error", rid, message[, HTTP status: 400 for an image or video that cannot be decoded]), ("metrics", dict), ("config", settings, n: the change answered, or None),
+("memory", the pools: once after "ready"), ("stats", snapshot: the requests, KV pool and device memory, every STATS_INTERVAL s while busy),
+("event", rid, kind, text: an admission wait, a preemption, an engine error).
 """
 
 import array
 import collections
+import ctypes
 import os
 import random
 import sys
@@ -39,12 +43,18 @@ PREFILL, DECODE = "prefill", "decode"
 PAGE = 64  # tokens of a KV page (kernels.h kPageTokens)
 ADMIT_RECHECK = 0.05  # s between checks of a request kept waiting by the admission
 RATE_WINDOW = 10.0    # s of decoding the measured tok/s per request averages over
+STATS_INTERVAL = 0.5  # s between stats snapshots (the stats UI) while requests run
+STATS_IDLE = 5.0      # s between them while idle
 
 
 def step_ms(n):
     """Time of a batched step for n requests (short contexts, gdnfp4 + KV nvfp4, P7-11: 12.40 / 13.76 / 16.39 /
     21.99 ms for 1 / 2 / 4 / 8): scales a measured rate per request to a number of requests not measured yet."""
     return 11.1 + 1.36 * n
+
+
+class ImageError(Exception):
+    """An image or video of the request cannot be decoded (the client's error: 400)."""
 
 
 def log(msg):
@@ -59,11 +69,33 @@ class Seq:
         self.prompt = list(req["ids"])
         self.max_new = req["max_new"]
         self.temperature, self.top_k, self.top_p = req["temperature"], req["top_k"], req["top_p"]
+        self.min_p = req.get("min_p", 0.0)
+        self.presence, self.frequency = req.get("presence_penalty", 0.0), req.get("frequency_penalty", 0.0)
+        self.logprobs = req.get("logprobs", -1)  # top logprobs per token (0..20; -1: none)
+        # logit_bias ({token id: value}), min_tokens (the end-of-sequence ids are banned until that many tokens are
+        # out) and ignore_eos (they are ordinary tokens): the engine's logit bias (Engine.bias_set) and its steps.
+        self.bias = {int(k): float(v) for k, v in (req.get("logit_bias") or {}).items()}
+        self.min_tokens, self.ignore_eos = req.get("min_tokens", 0), bool(req.get("ignore_eos"))
         self.rng = random.Random(req.get("seed"))
-        self.images = req.get("images")  # (spans [(start, gh, gw)], pixel arrays) or None
+        # (spans [(start, gh, gw)], [source per span], [(encoded video, plan)]) or None: server.py Images.prepare
+        self.images = req.get("images")
+        self.decoding = {}       # image index -> Future of its pixels (imageproc.rgb), ("video", k) -> of the
+        #                          video's frames (videoproc.frames), started on arrival
         self.arrival = now
         self.out = []            # generated tokens (EOS excluded)
         self.eng_ids = self.prompt  # what the engine runs (prompt + earlier output after a preemption)
+        # Forced output (tool_choice): (token id, ids) continues the output with ids after that token (the end of the
+        # reasoning); with no token id, the output starts with them. unsent: forced tokens the server has not got yet
+        # (they go out with the next generated ones).
+        self.force, self.unsent = req.get("force"), []
+        if self.force is not None and self.force[0] is None:
+            self.out, self.force = list(self.force[1]), None
+            self.eng_ids, self.unsent = self.prompt + self.out, list(self.out)
+        # Structured output: the llguidance grammar, and the token after which it applies (the end of the
+        # reasoning; None: from the start). matcher: made on arrival (Scheduler.submit); gm: the same once the grammar
+        # applies (every output token after that goes through it, and the engine masks the logits by it).
+        self.grammar, self.grammar_after = req.get("grammar"), req.get("grammar_after")
+        self.matcher = self.gm = None
         self.started = False     # prefix_begin done (the engine holds its state: running or parked)
         self.area = None         # parking area while parked
         self.phase = PREFILL
@@ -79,6 +111,16 @@ class Seq:
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
         self._bytes = None
+        self.begun = None        # time of the first prefix_begin
+        self.computed = 0        # prompt tokens prefilled (not restored from the cache)
+        self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
+        self.steps = 0           # decode steps (speculative: verify steps)
+        self.drafted = self.draft_accepted = 0  # draft tokens verified, and those accepted (as llama.cpp counts them)
+        self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
+
+    @property
+    def biased(self):
+        return bool(self.bias) or self.min_tokens > 0
 
     def rest(self):
         return len(self.eng_ids) - (self.fed if self.started else self.est_cached)
@@ -94,10 +136,17 @@ class Scheduler:
         from q27lib import Engine, KvFull
 
         self.conn, self.cfg, self.KvFull = conn, cfg, KvFull
-        os.environ.update(cfg.get("env", {}))
+        for k, v in cfg.get("env", {}).items():  # (the start settings, launch.py; None: unset)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         self.engine = Engine(cfg["model"], max_tokens=cfg["max_tokens"], prefill_chunk=cfg["prefill_chunk"],
                              kv_dtype=cfg["kv_dtype"], draft=cfg.get("draft"))
         self.spec = cfg.get("draft") is not None and self.engine.has_draft
+        # Draft tokens are reported for chains (the block's rows but the first; DSpine's single steps: 7 or 15 by the
+        # adaptive width, batched steps 7). Several paths verify a tree: not reported.
+        self.draft_block = 7 if int(os.environ.get("Q27_SPEC_PATHS") or 1) <= 1 else 0
         self.engine_seqs = max(1, min(cfg["max_seqs"], self.engine.park_slots + 1))
         self.max_seqs = self.engine_seqs  # the target number of running requests (<= engine_seqs)
         self.admit_kv, self.kv_reserve, self.min_tps = True, 4096, 0.0
@@ -111,14 +160,23 @@ class Scheduler:
         self.quantum = cfg["quantum_ms"] / 1000.0
         self.eos = set(cfg["eos"])
         self.im_start = cfg["im_start"]
+        self.user = cfg.get("user")
+        self.breaks = frozenset(cfg.get("breaks", ()))
         self.waiting = collections.deque()
         self.alive = []          # admitted, unfinished
         self.by_id = {}
         self.cur = None          # the sequence in the engine's working state (may be finished)
         self.credit = 0.0        # decode time owed to decoding requests by the prefills (DECODE_SHARE)
         self.history = collections.deque(maxlen=64)  # recent sequences (prompt + output) as int32 bytes
+        self.decoder = None      # threads that decode images (prefetch)
+        # Loans of KV pool memory for decoding videos on NVDEC (Engine.kv_lend: the driver allocates the decoder's
+        # surfaces outside the engine's pools), made and returned on this thread; a decoder thread queues its loan
+        # here when it is done.
+        self.returns = collections.deque()
         self.m = collections.Counter()
-        self.last_metrics = 0.0
+        self.last_metrics = self.last_stats = 0.0
+        self.cache_full = False  # every state slot of the prefix cache allocated (poll)
+        self.lltok = None        # llguidance's tokenizer (structured output; made with the first grammar)
 
     # ------------------------------------------------------------ messages
 
@@ -126,8 +184,14 @@ class Scheduler:
         self.conn.send(msg)
 
     def poll(self, block):
+        self.unlend()
+        # Idle: allocate the prefix cache's state slots one by one (not at startup, so the engine is ready sooner),
+        # then wake up now and then for a stats snapshot.
+        if block and not self.cache_full:
+            self.cache_full = self.engine.cache_grow(1) == 0
+            block = self.cache_full
         if block:
-            self.conn.poll(None)
+            self.conn.poll(STATS_IDLE)
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
@@ -142,6 +206,14 @@ class Scheduler:
 
     def submit(self, rid, req):
         s = Seq(rid, req, time.time())
+        if s.grammar is not None:
+            try:
+                s.matcher = self.matcher(s.grammar)
+            except ValueError as e:
+                self.send("error", rid, str(e), 400)
+                return
+            s.gm = s.matcher if s.grammar_after is None else None
+            self.m["q27:structured_requests_total"] += 1
         s.reusable = self.reusable(s.prompt)
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
@@ -158,10 +230,96 @@ class Scheduler:
                 o.at = sorted(set(o.at) | {s.share_len})
             s.reusable = s.share_len
         s.at = self.checkpoints(s.prompt, s.reusable)
+        # (stats: where the first message ends, the last message and the generation prompt start)
+        starts = [i for i, t in enumerate(s.prompt) if t == self.im_start]
+        s.marks = (starts[1:2] or [0]) + (starts[-2:-1] or [0]) + (starts[-1:] or [0])
         s.est_cached = s.reusable
+        if s.images:
+            self.prefetch(s)
         self.by_id[rid] = s
         self.waiting.append(s)
         self.m["q27:requests_total"] += 1
+
+    def matcher(self, grammar):
+        """An llguidance matcher of a grammar (structured output); ValueError when it cannot be used."""
+        import llguidance
+
+        if self.lltok is None:
+            t0 = time.time()
+            words = self.engine.mask_row(0)[1] * 8  # (the engine's mask rows: one bit per token of its vocabulary)
+            self.lltok = llguidance.LLTokenizer(self.cfg["tokenizer"], n_vocab=words, eos_token=sorted(self.eos))
+            log(f"grammar tokenizer ready ({time.time() - t0:.2f} s)")
+        m = llguidance.LLMatcher(self.lltok, grammar, log_level=0)
+        if m.is_error():
+            raise ValueError(f"the output format cannot be used: {m.get_error()}")
+        return m
+
+    def prefetch(self, s):
+        """Starts decoding the images and videos that lie past the reusable prefix, which begin() will likely
+        encode, on threads while the request waits (those inside the prefix are decoded only if the cache misses
+        them)."""
+        if self.decoder is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self.decoder = ThreadPoolExecutor(2, thread_name_prefix="image")
+        spans, srcs, _ = s.images
+        for i, ((start, gh, gw), src) in enumerate(zip(spans, srcs)):
+            if start + gh * gw > s.reusable:
+                key = i if src[0] == "image" else ("video", src[1])
+                if key not in s.decoding:  # (a video: from its first pair past the prefix on)
+                    g = src[2] if src[0] == "video" else 0
+                    sessions, loan = self.lend(s, key, g)
+                    f = self.decoder.submit(self.decode, s, key, sessions, g)
+                    if loan >= 0:
+                        f.add_done_callback(lambda _, loan=loan: self.returns.append(loan))  # (cancelled too)
+                    f.first_pair = g
+                    s.decoding[key] = f
+
+    def lend(self, s, key, g=0):
+        """(sessions, loan): the parallel decoders for video `key` from its pair g on and a loan of KV pool memory
+        covering what they take (-1: none; an image, or a pool that cannot spare it: then one decoder, the memory
+        taken beyond the budget)."""
+        if not isinstance(key, tuple):
+            return 0, -1
+        import videoproc
+
+        raw, plan = s.images[2][key[1]]
+        plan = videoproc.tail(plan, g)
+        try:
+            need, sessions = videoproc.memory(raw, plan)
+        except ValueError:  # (the decode reports it)
+            return 0, -1
+        loan = self.engine.kv_lend(need)
+        if loan < 0 and sessions > 1:
+            need, sessions = videoproc.memory(raw, plan, 1)
+            loan = self.engine.kv_lend(need)
+        if loan < 0:
+            log(f"{s.rid}: decoding a video with {need / 2**20:.0f} MiB of device memory not lent by the KV pool")
+        return sessions, loan
+
+    def unlend(self):
+        while self.returns:
+            self.engine.kv_unlend(self.returns.popleft())
+
+    @staticmethod
+    def decode(s, key, sessions=0, g=0):
+        """The pixels of image `key` (imageproc.rgb) or the frames of video ("video", k) from its pair g on
+        (videoproc.frames; only the samples from the closed key frame before them are decoded)."""
+        spans, srcs, videos = s.images
+        if isinstance(key, tuple):
+            import videoproc
+
+            raw, plan = videos[key[1]]
+            return videoproc.frames(raw, videoproc.tail(plan, g), sessions=sessions)
+        import imageproc
+
+        _, raw, size, _ = srcs[key]
+        return imageproc.rgb(raw, size)
+
+    def drop_decoding(self, s):
+        for f in s.decoding.values():
+            f.cancel()
+        s.decoding.clear()
 
     def cancel(self, rid):
         s = self.by_id.get(rid)
@@ -206,6 +364,7 @@ class Scheduler:
             s.held = True
             self.m[f'q27:admission_waits_total{{reason="{reason}"}}'] += 1
             log(f"{s.rid}: waits for room ({reason}), {len(self.alive)} running")
+            self.send("event", s.rid, "wait", f"waits for room ({reason}), {len(self.alive)} running")
         self.blocked = reason
         self.held_until = (s, time.time() + ADMIT_RECHECK) if reason else (None, 0.0)
         return reason is None
@@ -276,9 +435,20 @@ class Scheduler:
         """Checkpoints of a prompt (docs/architecture.md §9): the end of the first message (the shared system prompt
         and tools), the starts of the last message and of the generation prompt (a retried request, or a
         client that rewrites the last turn), and where the prompt leaves the longest earlier sequence (a
-        prefix shared inside a message). The end of the generation is saved after it."""
+        prefix shared inside a message), and after the last blank line of a final user message (a document followed
+        by a question: the next question about it shares the document). The end of the generation is saved
+        after it."""
         starts = [i for i, t in enumerate(prompt) if t == self.im_start]
         at = set(starts[1:2] + starts[-2:])
+        if len(starts) >= 2 and starts[-2] + 1 < len(prompt) and prompt[starts[-2] + 1] == self.user:
+            # (positions are rounded down to 64 in the engine: the generation prompt's start can land past the end of
+            # the document and miss a follow-up question that differs only after it)
+            b = next((i + 1 for i in range(starts[-1] - 1, starts[-2], -1) if prompt[i] in self.breaks), 0)
+            g = starts[-1] // 64 * 64
+            if b and b // 64 * 64 < g:
+                if g - b // 64 * 64 <= 64:  # (one block apart: a chunk of 64 tokens would take the decode GEMMs)
+                    at.discard(starts[-1])
+                at.add(b)
         if reusable > 0:
             at.add(reusable)
         return sorted(at)
@@ -288,10 +458,11 @@ class Scheduler:
     def run(self):
         self.send("ready", {"max_tokens": self.engine.max_tokens, "max_seqs": self.engine_seqs, "spec": self.spec,
                             "vision": self.engine.has_vision})
+        self.send("memory", self.engine.memory_report())
         self.send("config", self.settings(), None)
         log(f"{self.engine_seqs} sequences at once (target {self.max_seqs}, KV admission {'on' if self.admit_kv else 'off'}, "
             f"min {self.min_tps:g} tok/s per request), decode share {self.share}, quantum {self.quantum * 1000:.0f} ms, "
-            f"{'DFlash2' if self.spec else 'no speculative decoding'}, "
+            f"{'speculative decoding (' + str(self.engine.spec_block) + '-row blocks)' if self.spec else 'no speculative decoding'}, "
             f"{'batched decode steps' if self.batch else 'decode in turns'}")
         while True:
             self.poll(block=not self.alive and not self.waiting)
@@ -302,9 +473,18 @@ class Scheduler:
             job = self.pick()
             if job:
                 self.guarded(*job)
-            if time.time() - self.last_metrics > 2.0:
-                self.send("metrics", self.metrics())
-                self.send("config", self.settings(), None)
+            # (stats also once more when the work is done, and after each idle wait)
+            self.report(force=not (self.alive or self.waiting))
+
+    def report(self, force=False):
+        """Metrics and admission settings every 2 s, stats snapshots every STATS_INTERVAL (also from inside a
+        long decode turn: one request alone decodes until it ends or a message arrives)."""
+        now = time.time()
+        if now - self.last_metrics > 2.0:
+            self.send("metrics", self.metrics())
+            self.send("config", self.settings(), None)
+        if force or now - self.last_stats > STATS_INTERVAL:
+            self.send("stats", self.stats())
 
     def can_prefill(self, s):
         o = s.share_with
@@ -363,12 +543,20 @@ class Scheduler:
                 self.suspend(victim)
                 if victim is s:
                     return None
+            except ImageError as e:  # (an image the server could read the size of but not decode)
+                log(f"{s.rid}: {e}")
+                self.send("error", s.rid, str(e), 400)
+                self.finish(s, "error", save=False, notify=False)
+                self.engine.reset()
+                self.cur = None
+                return None
             except RuntimeError as e:
                 msg = str(e)
                 if "check failed" not in msg:  # a CUDA error: the context is unusable, restart the process
                     raise
                 for o in s if kind == "batch" else [s]:
                     log(f"{o.rid}: {msg}")
+                    self.send("event", o.rid, "error", msg)
                     self.send("error", o.rid, msg)
                     self.finish(o, "error", save=False, notify=False)
                 self.engine.reset()
@@ -404,45 +592,110 @@ class Scheduler:
         self.cur = s
         s.started, s.fed = True, cached
         if s.cached is None:
-            s.cached = cached
+            s.cached, s.begun = cached, time.time()
             self.m["q27:prompt_tokens_total"] += len(s.prompt)
             self.m["q27:cached_tokens_total"] += cached
             self.m["q27:reusable_tokens_total"] += s.reusable
             log(f"{s.rid}: prompt {len(s.prompt)} tokens, cached {cached} of {s.reusable} reusable, "
                 f"waited {time.time() - s.arrival:.2f} s, checkpoints at {s.at}")
             self.send("start", s.rid, {"cached": cached})
+        else:  # (after a preemption or a forced output)
+            log(f"{s.rid}: resumed at {len(s.eng_ids)} tokens, {cached} restored from the prefix cache")
         if s.images:
-            spans, pixels = s.images
+            spans, srcs, _ = s.images
             self.engine.mm_set(spans)
-            t0, encoded = time.time(), 0
-            for i, (start, gh, gw) in enumerate(spans):
-                if start + gh * gw > cached:  # (images inside the restored prefix need no embeddings)
-                    self.engine.mm_encode(i, pixels[i])
-                    encoded += 1
+            t0, encoded, waited = time.time(), 0, 0.0
+
+            def pixels(key, g=0):
+                """The image's pixels, or the video's frames from its pair g on."""
+                nonlocal waited
+                t1, f = time.time(), s.decoding.pop(key, None)
+                loan = -1
+                try:
+                    if f is not None and f.first_pair <= g:  # (prefetched from its first pair past the prefix)
+                        out = f.result()
+                        return out[2 * (g - f.first_pair):] if isinstance(key, tuple) else out
+                    if f is not None:  # (the cache restored less than the prefetch expected: earlier pairs too)
+                        f.cancel()
+                    sessions, loan = self.lend(s, key, g)
+                    return self.decode(s, key, sessions, g)
+                except Exception as e:  # noqa: BLE001 - any decoder error is the client's
+                    raise ImageError(f"cannot decode {'video' if isinstance(key, tuple) else 'image'}: {e}") from e
+                finally:
+                    if loan >= 0:
+                        self.engine.kv_unlend(loan)
+                    self.unlend()
+                    waited += time.time() - t1
+
+            i, frames = 0, {}
+            while i < len(spans):
+                start, gh, gw = spans[i]
+                src = srcs[i]
+                if start + gh * gw <= cached:  # (images inside the restored prefix need no embeddings)
+                    i += 1
+                    continue
+                if src[0] == "image":
+                    self.engine.mm_encode_rgb(i, pixels(i), src[3])
+                    i, encoded = i + 1, encoded + 1
+                    continue
+                k = src[1]  # (a video: its pairs from here to its end, encoded together)
+                j = i
+                while j < len(spans) and srcs[j][0] == "video" and srcs[j][1] == k:
+                    j += 1
+                # (the pairs from the first one past the restored prefix to the video's end: decoded from there)
+                frames[k] = pixels(("video", k), src[2])
+                self.engine.mm_encode_frames(i, frames[k][:2 * (j - i)], src[3])
+                i, encoded = j, encoded + j - i
+            frames.clear()
+            self.drop_decoding(s)  # (the pixels are not kept: a suspended request that needs them decodes again)
             log(f"{s.rid}: images {len(spans)} ({sum(gh * gw for _, gh, gw in spans)} tokens), encoded {encoded} "
-                f"in {time.time() - t0:.3f} s")
+                f"in {time.time() - t0:.3f} s ({waited:.3f} s decoding or waiting for it)")
 
     def prefill_turn(self, s):
         self.load(s)
-        t0 = time.time()
+        t0, fed0 = time.time(), s.fed
         rest = s.eng_ids[s.fed:]
         if len(rest) > self.chunk:
             s.fed += self.engine.prefill(rest, self.chunk, spec=self.spec)
         else:
             left = s.max_new - len(s.out)
             seed = s.rng.getrandbits(63)
+            if s.presence or s.frequency:
+                self.engine.penalty_init(s.out)  # (after a preemption the earlier output counts too)
+            if s.biased:  # (min_tokens: output token j is at position len(prompt) + j)
+                self.engine.bias_set(s.bias, len(s.prompt) + s.min_tokens if s.min_tokens > len(s.out) else 0)
+            extra = dict(min_p=s.min_p, presence=s.presence, frequency=s.frequency, logprobs=s.logprobs,
+                         masked=s.gm is not None, biased=s.biased)
+            # A step ends at the end of the reasoning when a forced output or a grammar follows it, so the engine holds
+            # no tokens past it (sampled without the forced tokens, or the masks).
+            until = s.force[0] if s.force is not None else s.grammar_after if s.matcher is not None and s.gm is None \
+                else None
+            if s.gm is not None:
+                write_mask(self.engine, s.gm, 0)
             if self.spec:
                 tok = self.engine.spec_begin(rest, s.temperature, s.top_k, s.top_p, seed=seed,
-                                             uniform=s.rng.random(), max_new=left)
+                                             uniform=s.rng.random(), max_new=left, until=until,
+                                             ignore_eos=s.ignore_eos, **extra)
             else:
-                tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random())
+                tok = self.engine.forward_sample(rest, s.temperature, s.top_k, s.top_p, s.rng.random(), **extra)
             s.fed = len(s.eng_ids)
             s.phase = DECODE
             if s.first_token is None:
                 s.first_token = time.time()
-            self.emit(s, [tok])
+        fed = s.fed  # (a forced output in the emit starts the request again: s.fed is 0 after it)
+        if s.phase == DECODE:
+            self.emit(s, [tok], self.engine.logprobs() if s.logprobs >= 0 else None)
         dt = time.time() - t0
         s.last_run = time.time()
+        s.prefill_s += dt
+        s.computed += fed - fed0
+        if s.phase == DECODE and not s.dead:
+            # The server answers a request its stop string ends with this and its own count of the steps after
+            # it, rather than wait for "done", which follows the cancel only after the engine's next step.
+            self.send("prefilled", s.rid, {"ttft": s.first_token - s.arrival, "prefill_s": s.prefill_s,
+                                           "computed_tokens": s.computed, "drafted": s.drafted,
+                                           "draft_accepted": s.draft_accepted, "draft_block": self.draft_block if self.spec else 0})
+        self.m["q27:prefill_tokens_total"] += fed - fed0
         if any(o.phase == DECODE for o in self.alive if o is not s):
             self.credit += self.share * dt
 
@@ -453,21 +706,32 @@ class Scheduler:
         has_prefill = any(o.phase == PREFILL for o in self.alive)
         turn = min(self.quantum, max(self.credit, 0.0)) if has_prefill else self.quantum
         step, n0 = 0.0, len(s.out)
-        while not s.dead:
+        while not s.dead and s.phase == DECODE:  # (a forced output makes it a prefill again)
             now = time.time()
-            last = (others and now + step >= t0 + turn) or self.conn.poll(0)
+            last = (others and now + step >= t0 + turn) or self.conn.poll(0) or bool(self.returns)
             ts = time.time()
             if self.spec:
+                if s.gm is not None:
+                    write_masks(self.engine, s.gm, self.engine.spec_draft(), 0, self.eos)
                 toks = self.engine.spec_step(ahead=not last)
                 self.m["q27:spec_verify_calls_total"] += 1
+                self.count_draft(s, toks, self.engine.last_step_block - 1)
             else:
-                toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random())]
+                if s.gm is not None:
+                    write_mask(self.engine, s.gm, 0)
+                toks = [self.engine.forward_sample([s.out[-1]], s.temperature, s.top_k, s.top_p, s.rng.random(),
+                                                   min_p=s.min_p, presence=s.presence, frequency=s.frequency,
+                                                   logprobs=s.logprobs, masked=s.gm is not None,
+                                                   biased=s.biased)]
             step = max(step * 0.8, time.time() - ts)
-            self.emit(s, toks)
+            s.steps += 1
+            self.emit(s, toks, self.engine.logprobs() if s.logprobs >= 0 else None)
             if last:
                 break
+            self.report()
         dt = time.time() - t0
         s.last_run = time.time()
+        s.decode_s += dt
         if not others and self.spec:
             self.measure(1, len(s.out) - n0, dt)
         if has_prefill:
@@ -482,43 +746,120 @@ class Scheduler:
         lanes = [None if s is self.cur else s.area for s in seqs]
         n0 = sum(len(s.out) for s in seqs)
         while True:
+            if any(s.gm is not None for s in seqs):  # (structured output: drafted, masked by the grammars, verified)
+                for z, (s, chain) in enumerate(zip(seqs, self.engine.spec_draft_lanes(lanes))):
+                    if s.gm is not None:
+                        write_masks(self.engine, s.gm, chain, 16 * z, self.eos)
             new = self.engine.spec_step_lanes(lanes)
             self.m["q27:spec_verify_calls_total"] += len(seqs)
             self.m["q27:batched_steps_total"] += 1
-            for s, toks in zip(seqs, new):
-                self.emit(s, toks)
-            if any(s.dead for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0):
+            for z, (s, toks) in enumerate(zip(seqs, new)):
+                s.steps += 1
+                self.count_draft(s, toks, max(1, self.engine.last_lane_block(z) or 8) - 1)
+                self.emit(s, toks, self.engine.logprobs(z) if s.logprobs >= 0 else None)
+            if (any(s.dead or s.phase != DECODE for s in seqs) or time.time() >= t0 + turn or self.conn.poll(0)
+                    or self.returns):
                 break
         dt = time.time() - t0
         self.measure(len(seqs), sum(len(s.out) for s in seqs) - n0, dt)
         for s in seqs:
             s.last_run = time.time()
+            s.decode_s += dt
         if has_prefill:
             self.credit -= dt
 
-    def emit(self, s, toks):
-        """Tokens of a step: stops at EOS and at max_new; the rest goes to the server."""
-        out, finish = [], None
+    def count_draft(self, s, toks, drafted=7):
+        """A verify step's tokens are the accepted drafts and the bonus token. The server gets the counts so far too
+        (the timings of a request a stop string ends before the engine reports it)."""
+        if not self.draft_block:
+            return
+        s.drafted += drafted
+        s.draft_accepted += len(toks) - 1
+        self.send("drafts", s.rid, s.drafted, s.draft_accepted)
+
+    def emit(self, s, toks, logprobs=None):
+        """Tokens of a step: stops at EOS and at max_new, and at the token a forced output follows (force); the rest goes
+        to the server (with their logprobs, when the request asked for them), after forced tokens not sent yet.
+        Structured output: the tokens go through the grammar; at the end of the reasoning it starts to apply, and the
+        rest of that step (sampled without the masks) stays only as far as the grammar allows it."""
+        out, finish, force, began, cut = [], None, None, False, False
         for t in toks:
-            if t in self.eos:
+            if s.gm is not None and not allows(s.gm, t, self.eos):
+                cut = True  # (only right after the grammar began: masked steps output what it allows)
+                break
+            if t in self.eos and not s.ignore_eos:
                 finish = "stop"
                 break
             out.append(t)
+            if s.gm is not None:
+                s.gm.consume_token(t)
             if len(s.out) + len(out) >= s.max_new:
                 finish = "length"
                 break
+            if s.force is not None and t == s.force[0]:
+                force = s.force[1]
+                break
+            if s.matcher is not None and s.gm is None and t == s.grammar_after:
+                s.gm, began = s.matcher, True
         if out:
             s.out += out
             self.m["q27:generation_tokens_total"] += len(out)
-            self.send("tok", s.rid, out)
+        if out or s.unsent:
+            self.send_toks(s, out, logprobs)
         if finish:
             self.finish(s, finish)
+        elif force is not None:
+            self.force_output(s, force)
+        elif cut:
+            # The engine holds tokens past the grammar's: s runs its prompt + output again from the prefix cache.
+            self.m["q27:grammar_restarts_total"] += 1
+            self.restart(s)
+            s.est_cached = len(s.prompt) - 1
+        elif began and self.spec:
+            self.engine.spec_set_masked(None if s is self.cur else s.area)
+
+    def send_toks(self, s, out, logprobs=None):
+        """Sends output tokens, after the forced ones not sent yet (their logprob: 0, no top entries)."""
+        forced, s.unsent = s.unsent, []
+        if s.logprobs < 0:
+            self.send("tok", s.rid, forced + out)
+        else:
+            self.send("tok", s.rid, forced + out, [(0.0, [])] * len(forced) + list((logprobs or [])[:len(out)]))
+
+    def force_output(self, s, ids):
+        """The output continues with ids (the forced start of a tool call after the reasoning, tool_choice): s's state
+        becomes a prefix cache checkpoint and s runs its prompt + output + ids from the deepest one (its own if the
+        tokens committed past the reasoning's end are ids', else the start of the generation prompt: the reasoning
+        is computed again)."""
+        s.force = None
+        ids = list(ids[:s.max_new - len(s.out)])
+        s.out += ids
+        s.unsent += ids
+        self.m["q27:forced_outputs_total"] += 1
+        if len(s.out) >= s.max_new:
+            self.send_toks(s, [])
+            self.finish(s, "length")
+            return
+        self.restart(s)
+        s.est_cached = len(s.eng_ids) - len(ids)  # (prompt + output up to the reasoning's end: its own checkpoint)
 
     def suspend(self, v):
         """Preemption (KV pool full): v's state becomes a prefix cache checkpoint and its pages go back; it
         waits at the head of the queue (the admission lets it in again) as a prompt of its prompt + output."""
         saved = len(v.eng_ids) if v.phase == DECODE else v.fed
         log(f"{v.rid}: preempted at {saved} tokens (KV pool full)")
+        self.send("event", v.rid, "preempt", f"preempted at {saved} tokens (KV pool full)")
+        self.restart(v)
+        v.est_cached = min(saved, len(v.eng_ids) - 1)  # (the checkpoint it resumes from)
+        v.preempted += 1
+        self.m["q27:preemptions_total"] += 1
+        self.alive.remove(v)
+        self.waiting.appendleft(v)
+        v.held = False
+
+    def restart(self, v):
+        """v's state becomes a prefix cache checkpoint and leaves the engine; v runs again as a prompt of its prompt +
+        output (prefix_begin restores the deepest checkpoint of that)."""
         if v is self.cur:
             self.engine.checkpoint()
             self.engine.reset()
@@ -528,17 +869,12 @@ class Scheduler:
             v.area = None
         v.eng_ids = v.prompt + v.out  # (ids_bytes follows the new length)
         v.started, v.fed, v.phase = False, 0, PREFILL
-        v.est_cached = min(saved, len(v.eng_ids) - 1)  # (the checkpoint it resumes from)
-        v.preempted += 1
-        self.m["q27:preemptions_total"] += 1
-        self.alive.remove(v)
-        self.waiting.appendleft(v)
-        v.held = False
 
     def finish(self, s, reason, save=True, notify=True):
         if s.dead:
             return
         s.dead = True
+        self.drop_decoding(s)
         if s in self.alive:
             self.alive.remove(s)
         self.by_id.pop(s.rid, None)
@@ -555,7 +891,9 @@ class Scheduler:
         now = time.time()
         info = {"prompt_tokens": len(s.prompt), "completion_tokens": len(s.out), "cached_tokens": s.cached or 0,
                 "ttft": (s.first_token - s.arrival) if s.first_token else None, "total": now - s.arrival,
-                "preempted": s.preempted}
+                "preempted": s.preempted, "reusable_tokens": s.reusable, "computed_tokens": s.computed,
+                "queued": (s.begun - s.arrival) if s.begun else None, "prefill_s": s.prefill_s,
+                "decode_s": s.decode_s, "steps": s.steps, "drafted": s.drafted, "draft_accepted": s.draft_accepted}
         self.m[f'q27:requests_finished_total{{reason="{reason}"}}'] += 1
         if notify:
             self.send("done", s.rid, reason, dict(info, metrics=self.metrics()))
@@ -577,6 +915,63 @@ class Scheduler:
         return out
 
 
+    def stats(self):
+        """Snapshot for the stats UI: each request (where its context stands), the KV pool, device memory."""
+        self.last_stats = now = time.time()
+        st = self.engine.cache_stats()
+        seqs = []
+        for s in self.alive + list(self.waiting):
+            if s.dead:
+                continue
+            state = "waiting" if s not in self.alive else ("running" if s is self.cur else
+                                                          "parked" if s.area is not None else "admitted")
+            seqs.append({"rid": s.rid, "state": state, "phase": s.phase, "prompt": len(s.prompt),
+                         "cached": s.cached if s.cached is not None else s.est_cached,
+                         "fed": min(s.fed, len(s.prompt)) if s.started else 0, "out": len(s.out),
+                         "max_new": s.max_new, "computed": s.computed, "reusable": s.reusable,
+                         "age": now - s.arrival, "queued": (s.begun or now) - s.arrival,
+                         "ttft": (s.first_token - s.arrival) if s.first_token else None,
+                         "decode_wall": (now - s.first_token) if s.first_token else 0.0,
+                         "prefill_s": s.prefill_s, "decode_s": s.decode_s, "steps": s.steps,
+                         "preempted": s.preempted, "held": s.held and s in self.waiting,
+                         "images": sum(gh * gw for _, gh, gw in s.images[0]) if s.images else 0,
+                         "marks": s.marks})
+        return {"t": now, "seqs": seqs, "cache": st, "device": self.engine.device_memory(),
+                "running": len(self.alive), "waiting": len(self.waiting), "blocked": self.blocked,
+                "target_seqs": self.max_seqs, "busy_s": self.m["q27:engine_busy_seconds_total"],
+                "generated": self.m["q27:generation_tokens_total"], "prefilled": self.m["q27:prefill_tokens_total"]}
+
+
+def allows(m, t, eos):
+    """Whether llguidance matcher m takes token t next (its validate_tokens does not count an end-of-sequence id)."""
+    return m.is_accepting() if t in eos else m.validate_tokens([t]) == 1
+
+
+def write_mask(engine, m, row):
+    """Writes engine mask row `row`: what llguidance matcher m allows next."""
+    addr, size = engine.mask_row(row)
+    m.unsafe_compute_mask_ptr(addr, size)
+
+
+def write_masks(engine, m, chain, row0, eos):
+    """Grammar masks of a speculative step's verify rows row0 .. row0 + len(chain) - 1 (chain: their tokens, Engine.spec_draft; the
+    first, the last output token, has been through matcher m): row i masks by what follows chain[1..i]. Rows past a
+    drafted token the grammar does not allow, or an end-of-sequence id (eos), are left open: that token is rejected,
+    or ends the step. (A matcher that consumed an end-of-sequence id does not roll back to the state before it.)"""
+    k = m.validate_tokens(chain[1:])
+    k = next((i for i, t in enumerate(chain[1:1 + k]) if t in eos), k)
+    for i in range(len(chain)):
+        addr, size = engine.mask_row(row0 + i)
+        if i and i <= k:
+            m.consume_token(chain[i])
+        if i <= k:
+            m.unsafe_compute_mask_ptr(addr, size)
+        else:
+            ctypes.memset(addr, 0xFF, size)
+    if k:
+        m.rollback(k)
+
+
 def lcp_bytes(a, b):
     """Common prefix of two int32 byte strings, in tokens."""
     lo, hi = 0, min(len(a), len(b)) // 4
@@ -593,10 +988,12 @@ def run(conn, cfg):
         Scheduler(conn, cfg).run()
     except SystemExit:
         raise
-    except BaseException:  # noqa: BLE001 - report and exit; the server starts a new engine
-        traceback.print_exc()
+    except BaseException as e:  # noqa: BLE001 - report and exit; the server starts a new engine
+        refused = "not enough VRAM" in str(e)
+        if not refused:
+            traceback.print_exc()
         try:
-            conn.send(("fatal", traceback.format_exc(limit=3)))
+            conn.send(("refused", str(e)) if refused else ("fatal", traceback.format_exc(limit=3)))
         except OSError:
             pass
         os._exit(1)

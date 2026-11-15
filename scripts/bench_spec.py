@@ -1,4 +1,4 @@
-"""Speculative decoding (DFlash2) of the engine, in-process: decode speed and acceptance length.
+"""Speculative decoding (DFlash2 or DSpine, --draft) of the engine, in-process: decode speed and acceptance length.
 
 Uses the decode prompts of bench_agentic.py (code / json / prose, chat template, thinking off) and the
 checkpoint's default sampling (temperature 1.0, top-k 20, top-p 0.95) unless --temperature is given.
@@ -7,7 +7,8 @@ The acceptance length is the generated tokens per verify step (the first token c
 
 --check-greedy N: greedy, N tokens per prompt, speculative vs plain decoding; the token sequences must
 be identical (the verify rows are bit-identical to decode steps; the run sets Q27_SKINNY_EXACT=1, the
-split-K policy that does not depend on the number of rows).
+split-K policy that does not depend on the number of rows, and with Q27_SPEC_PATHS > 1 Q27_ATTN_TC=0: the
+tree's attention runs on CUDA cores).
 
 --ab CFG [CFG ...]: A/B of runtime switches in one process (like ab_decode.py): each config ("-" or
 KEY=VALUE,...) runs greedy speculative decoding of the prompts in turn for --rounds rounds; greedy makes
@@ -56,9 +57,12 @@ def chat_ids(tok, text):
     return list(ids["input_ids"]) if not isinstance(ids, list) else ids
 
 
-def run_spec(eng, ids, max_tokens, temperature, top_k, top_p, seed):
+def run_spec(eng, ids, max_tokens, temperature, top_k, top_p, seed, **more):
+    """more: min_p, presence, frequency (penalties: the counts start empty), logprobs."""
     t0 = time.perf_counter()
-    out = [eng.spec_begin(ids, temperature, top_k, top_p, seed=seed, uniform=random.Random(seed).random())]
+    if more.get("presence") or more.get("frequency"):
+        eng.penalty_init([])
+    out = [eng.spec_begin(ids, temperature, top_k, top_p, seed=seed, uniform=random.Random(seed).random(), **more)]
     t_first = time.perf_counter()
     steps = 0
     while len(out) < max_tokens and out[-1] not in EOS:
@@ -87,6 +91,10 @@ def main():
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--top-p", type=float, default=0.95)
+    ap.add_argument("--min-p", type=float, default=0.0)
+    ap.add_argument("--presence", type=float, default=0.0, help="presence penalty")
+    ap.add_argument("--frequency", type=float, default=0.0, help="frequency penalty")
+    ap.add_argument("--logprobs", type=int, default=-1, help="top logprobs per token (0..20; -1: none)")
     ap.add_argument("--prompts", default="code,json,prose")
     ap.add_argument("--check-greedy", type=int, default=0, metavar="N")
     ap.add_argument("--label", default="spec")
@@ -98,6 +106,7 @@ def main():
     ap.add_argument("--kv-dtype", choices=["bf16", "fp8", "nvfp4"], default=None,
                     help="KV cache dtype; overrides --kv-fp8 when supplied")
     ap.add_argument("--weights", default="nvidia", help="weight profile (Phase Q): nvidia | quasar | a model directory")
+    ap.add_argument("--draft", default="dflash2", help="draft model: dflash2 | dspine | a directory")
     args = ap.parse_args()
     if args.profile:
         import os
@@ -107,15 +116,22 @@ def main():
     from transformers import AutoTokenizer
 
     from q27lib import Engine
-    from qwen27b.weights import DFLASH2, TARGET, engine_target, snapshot
+    from qwen27b.weights import DFLASH2, DSPINE, TARGET, engine_target, snapshot
+
+    def draft_dir(d):
+        return snapshot(*{"dflash2": DFLASH2, "dspine": DSPINE}[d]) if d in ("dflash2", "dspine") else d
 
     if args.check_greedy:
         import os
         os.environ["Q27_SKINNY_EXACT"] = "1"
+        # Tree verification (Q27_SPEC_PATHS > 1) runs its attention on CUDA cores, decode and chains on tensor cores: a
+        # different summation order, which W4A4 carries to visibly different distributions. Both on CUDA cores here.
+        if int(os.environ.get("Q27_SPEC_PATHS", "1")) > 1:
+            os.environ.setdefault("Q27_ATTN_TC", "0")
     tok = AutoTokenizer.from_pretrained(snapshot(*TARGET))
     t0 = time.perf_counter()
     eng = Engine(engine_target(args.weights), max_tokens=8192,
-                 kv_dtype=args.kv_dtype or ("fp8" if args.kv_fp8 else "bf16"), draft=snapshot(*DFLASH2))
+                 kv_dtype=args.kv_dtype or ("fp8" if args.kv_fp8 else "bf16"), draft=draft_dir(args.draft))
     print(f"load {time.perf_counter() - t0:.1f} s", flush=True)
     names = args.prompts.split(",")
 
@@ -131,7 +147,8 @@ def main():
                 ms = []
                 for n in names:
                     eng.reset()
-                    out, steps, _, dt = run_spec(eng, ids[n], min(args.max_tokens, 400), 0.0, 1, 1.0, 0)
+                    out, steps, _, dt = run_spec(eng, ids[n], min(args.max_tokens, 400), 0.0, 1, 1.0, 0,
+                                                 **({"logprobs": args.logprobs} if args.logprobs >= 0 else {}))
                     ms.append(1000 * dt / max(steps, 1))
                 res[cfg].append(statistics.mean(ms))
                 print(f"round {r} {cfg:50s} {res[cfg][-1]:.3f} ms/step", flush=True)
@@ -170,7 +187,9 @@ def main():
             eng.reset()
             if args.profile:
                 eng.profile_dump()  # drop the prompt
-            out, steps, ttft, dt = run_spec(eng, ids, args.max_tokens, args.temperature, args.top_k, args.top_p, rep)
+            out, steps, ttft, dt = run_spec(eng, ids, args.max_tokens, args.temperature, args.top_k, args.top_p, rep,
+                                            min_p=args.min_p, presence=args.presence, frequency=args.frequency,
+                                            logprobs=args.logprobs)
             if args.profile:
                 print(f"--- profile {name}#{rep}", file=sys.stderr, flush=True)
                 eng.profile_dump()

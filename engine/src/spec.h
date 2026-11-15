@@ -10,10 +10,12 @@
 
 namespace q27 {
 
-constexpr int kSpecBlock = 8;  // the draft block: the anchor and 7 drafted tokens (the deepest path)
+constexpr int kSpecBlock = 16;  // the longest draft block: the anchor and up to 15 drafted tokens (the deepest path;
+                                // DFlash2 drafts 8, DSpine up to 16, Draft::block()). Batched steps: LaneRows
 constexpr int kSpecSelK = 16;  // selector candidates per position
 constexpr int kTreeMax = 32;   // verify rows: nodes of the draft tree (node 0 is the anchor)
 constexpr int kTreePaths = 4;  // root-to-leaf paths (draft walks)
+static_assert(kSpecBlock == kLogprobTokens, "Logprobs holds one step's tokens");
 
 // The draft tree of a step (written by the selector, read by the verify, accept and commit kernels).
 // K walks through the selector's lattice are merged into a trie: node i has token tok[i] at depth
@@ -39,7 +41,44 @@ struct SpecSampling {
   int top_k = 20;
   float top_p = 1.f;
   int paths = 1;            // draft walks merged into the tree (1: a chain)
-  int32_t stop[2] = {-1, -1};  // end-of-sequence ids: an accepted one ends the step as its last token (not fed)
+  // stop[0..1]: end-of-sequence ids: an accepted one ends the step as its last token (not fed). stop[2]: a token that
+  // also ends the step as its last one (the next step's anchor; -1: none): the end of the reasoning while the host
+  // waits for it (a forced tool call or a grammar follows it, see Model::spec_begin).
+  int32_t stop[3] = {-1, -1, -1};
+  float min_p = 0.f;
+  Penalty pen;              // presence / frequency; pen.counts is set where the step is built
+  int logprobs = -1;        // top logprobs per output token (0..20; < 0: no logprobs), see Logprobs
+  // Grammar masks (structured output): the verify rows' logits are masked by the host's bitmasks (Model::mask_rows)
+  // before the top-k, so a step is drafted first and verified after the host has written them (Model::spec_draft).
+  bool masked = false;
+  // Logit bias (BiasList): biased is set by the request; bias points to its sequence's list where the step is built.
+  bool biased = false;
+  const BiasList* bias = nullptr;
+  bool ignore_eos = false;  // stop[0..1] stay -1 (vLLM's ignore_eos: an end-of-sequence id is an ordinary token)
+  // Rows of a single sequence's block (0: the draft's, Draft::block()). The adaptive verify width (Model,
+  // Q27_SPEC_ADAPT) sets it from accept_ema, the moving average of the tokens per step, between steps; block_next is
+  // the width decided after the last step, block_due the one decided after the step before it. Step k + 1 always
+  // takes the width decided after step k - 1 (block_due), whether or not it was launched ahead of step k's result or
+  // a parked sequence dropped it, so the widths (and the steps) do not depend on the scheduling. Only past steps
+  // decide it, so the proposals stay a fixed distribution.
+  int block = 0, block_next = 0, block_due = 0;
+  float accept_ema = 0.f;
+  bool pinned = false;  // the width stays (Model::spec_set_block)
+  // Batched steps (Model::batch_prepare): the lane's rows (4 / 8 / 12 / 16, DSpine) and the moving average of its tokens
+  // per batched step at those rows. Past batched steps decide them, as the single width above.
+  int lane_rows = 8;
+  float lane_ema = 4.25f;
+  // The lane's tokens per step at 4 / 8 / 12 / 16 rows (lane_tok[c / 4 - 1]) once it ran them (bit c / 4 - 1 of
+  // lane_seen): measured widths are estimated from these, the others extrapolated from lane_ema.
+  float lane_tok[4] = {};
+  uint8_t lane_seen = 0;
+  bool penalized() const { return pen.presence != 0.f || pen.frequency != 0.f; }
+  bool same(const SpecSampling& o) const {  // (the settings a captured step depends on)
+    return temperature == o.temperature && top_k == o.top_k && top_p == o.top_p && paths == o.paths &&
+           min_p == o.min_p && pen.presence == o.pen.presence && pen.frequency == o.pen.frequency &&
+           logprobs == o.logprobs && masked == o.masked && stop[2] == o.stop[2] && biased == o.biased &&
+           ignore_eos == o.ignore_eos && block == o.block;
+  }
 };
 
 // The selector's choice, consumed by the accept kernel.
@@ -99,26 +138,57 @@ void topk_rows(const float* logits, int T, int V, int k, float* vals, int32_t* i
 // tokens are appended to hist at *pos (lookup drafting). par (optional): the result goes to out[*par].
 // budget (optional): at most max(1, *budget) tokens are output (an accepted end-of-sequence id, see
 // SpecSampling::stop, also ends the step).
-void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k, DraftChoice choice,
-                 SpecSampling smp, const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
-                 int32_t* hist, const int32_t* pos, cudaStream_t s, const int32_t* par = nullptr,
+// ld: entries per row of the top-k lists (>= k; 64 with penalties, see penalize_rows). smp.pen.counts
+// (optional): the committed tokens are counted.
+void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k, int ld,
+                 DraftChoice choice, SpecSampling smp, const uint64_t* rng, int32_t* ncommit, int32_t* cpath,
+                 SpecOut* out, int32_t* hist, const int32_t* pos, cudaStream_t s, const int32_t* par = nullptr,
                  const int32_t* budget = nullptr);
+// The penalties of verify rows, before the accept step: lane z's rows lr.first(z) .. (row r: node r of
+// trees[z]) of the sorted top-64 lists (ld entries per row) get pen[z] (counts plus the tokens on the
+// node's path from the root, the node's own included) and are sorted again. Lanes without counts are left.
+struct PenaltyLanes {
+  Penalty pen[kMaxLanes] = {};
+};
+// raw_v / raw_i (optional, logprobs): the first kMaxTopLogprobs entries of every row of the trees (all lanes) as they
+// were before, [rows of the lanes][kMaxTopLogprobs].
+void penalize_rows(float* tv, int32_t* ti, int ld, const LaneRows& lr, const PenaltyLanes& pl, const SpecTree* trees,
+                   cudaStream_t s, float* raw_v = nullptr, int32_t* raw_i = nullptr);
+// Logprobs of a step's output tokens (after spec_accept, before spec_advance), lane z (lr.n lanes; z = 0 alone) with
+// ln.n[z] top entries (< 0: none): token i < ncommit[z] came from row lr.first(z) + cpath[kLaneSlot z + i] of the
+// logits ([rows of the lanes][V]) and of the raw sorted lists tv / ti (ld entries per row, >= the top entries); it is
+// the next node's token on the path, the last one ids[lr.first(z)] (the bonus). The result goes to out[2 z + par[z]].
+struct LogprobLanes {
+  int n[kMaxLanes] = {-1, -1, -1, -1, -1, -1, -1, -1};
+};
+void spec_logprobs(const LaneRows& lr, const float* logits, int V, const float* tv, const int32_t* ti, int ld,
+                   const LogprobLanes& ln, const SpecTree* trees, const int32_t* cpath, const int32_t* ncommit,
+                   const int32_t* ids, Logprobs* out, const int32_t* par, cudaStream_t s);
+// counts[so->tok[i]] += delta for i < so->n (a dropped step's tokens: delta -1).
+void count_out(uint32_t* counts, const SpecOut* so, int delta, cudaStream_t s);
 // Batched steps (P6-10): the sampling of each lane and the length of its top-k lists (1 when greedy).
 struct AcceptLanes {
   SpecSampling smp[kMaxLanes] = {};
   int k[kMaxLanes] = {};
+  LaneRows lr;
 };
-// spec_accept for n lanes (block z: lane z). Lane z's verify rows are 8 z .. 8 z + 7 (ids, block_ids,
-// cpath, and the top-k lists tv / ti, ld entries per row), its candidates rows 8 z + 1 .. of cand
-// ([rows][16]), its tree trees[z], its scalars src / ncommit / pos / par / budget [z], rng [z][2], and
-// its results out[2 z + par[z]]. No token history (lookup drafting is off in batched steps).
-void spec_accept_lanes(int n, int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int ld,
+// spec_accept for al.lr.n lanes (block z: lane z). Lane z's verify rows are al.lr.first(z) .. (ids and the top-k lists
+// tv / ti, ld entries per row), its candidates on the rows after the first of cand ([rows][16]), its tree trees[z],
+// its scalars src / ncommit / pos / par / budget [z], rng [z][2], its commit path cpath + kLaneSlot z, and its
+// results out[2 z + par[z]]; the bonus token becomes anchor[z]. No token history (lookup drafting is off in batched
+// steps).
+void spec_accept_lanes(int32_t* ids, int32_t* anchor, const float* tv, const int32_t* ti, int ld,
                        const AcceptLanes& al, const int32_t* cand, SpecTree* trees, const int32_t* src,
                        const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out, const int32_t* pos,
                        const int32_t* par, const int32_t* budget, cudaStream_t s);
-// spec_advance of n lanes (no GDN state buffer: batched verifies replay in place).
-void spec_advance_lanes(int n, int32_t* pos, const int32_t* ncommit, int32_t* par, uint64_t* rng, int32_t* budget,
-                        cudaStream_t s);
+// spec_advance of the lanes (no GDN state buffer: batched verifies replay in place); prow0[z] = lr.first(z) (where
+// the next verify finds the rows of the commit it replays, GdnSpec::prow0).
+void spec_advance_lanes(const LaneRows& lr, int32_t* pos, const int32_t* ncommit, int32_t* par, uint64_t* rng,
+                        int32_t* budget, int32_t* prow0, cudaStream_t s);
+// The start of a batched step: lane z's block ids (anchor[z], then mask_id) on its rows of block_ids, and anchor[z]
+// on its first row of ids (the verify ids; the draft writes the rest).
+void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t* block_ids, int32_t* ids,
+                 cudaStream_t s);
 // The lookup match for the next draft block (see Lookup); `anchor` is the uncommitted last token.
 void spec_lookup(const Lookup& lk, const int32_t* anchor, cudaStream_t s);
 // End of a step: *pos += *ncommit, *par ^= 1, *sbuf ^= 1 (the GDN state buffer), rng[1] += 1, and

@@ -10,6 +10,7 @@
 #include "kernels.h"
 #include "draft.h"
 #include "model.h"
+#include "video.h"
 
 using namespace q27;
 
@@ -25,6 +26,9 @@ int guard(F&& f) {
   } catch (const KvFull& e) {  // (recoverable: the caller frees pages and retries)
     g_error = e.what();
     return -2;
+  } catch (const VideoError& e) {  // (the client's video cannot be used: HTTP 400)
+    g_error = e.what();
+    return -3;
   } catch (const std::exception& e) {
     g_error = e.what();
     return -1;
@@ -32,6 +36,13 @@ int guard(F&& f) {
 }
 
 float g_last_us = 0.f;
+
+VisionPixels rgb_pixels(const uint8_t* rgb, const float* norm) {
+  VisionPixels px;
+  px.rgb = rgb;
+  for (int c = 0; c < 3; c++) px.mean[c] = norm[c], px.std[c] = norm[3 + c];
+  return px;
+}
 
 // The kernel wrappers launch on this stream (a real stream: PDL applies and launches can be captured).
 cudaStream_t ts() {
@@ -103,6 +114,38 @@ struct DevInt {
   }
 };
 
+// The engine's options: the arguments of q27_create and the environment (docs/configuration.md).
+Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir) {
+  Options o;
+  o.model_dir = model_dir;
+  if (draft_dir && *draft_dir) o.draft_dir = draft_dir;
+  if (max_tokens > 0) o.max_tokens = max_tokens;
+  if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
+  o.logits_rows = std::min(o.logits_rows, o.prefill_chunk);
+  Q27_CHECK(kv_fp8 >= 0 && kv_fp8 <= 2, "kv type: 0 BF16, 1 FP8, 2 NVFP4");
+  o.kv_type = KvType(kv_fp8);  // (kv_fp8: the KV type code; 1 / true stays FP8)
+  // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
+  // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
+  if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
+  if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
+  if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
+  // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
+  // per request).
+  if (const char* e = getenv("VISION"); e && *e) {
+    const std::string v = e;
+    Q27_CHECK(v == "off" || v == "bf16" || v == "host" || v == "fp8", "VISION: off, bf16, host or fp8");
+    o.vision = v == "bf16" ? 1 : v == "host" ? 2 : v == "fp8" ? 3 : 0;
+  }
+  if (const char* e = getenv("IMAGE_MAX_PIXELS")) o.image_max_pixels = atoi(e);
+  if (const char* e = getenv("IMAGE_TOKENS")) o.image_tokens = atoi(e);
+  // Several sequences (Phase 6): MAX_SEQS - 1 parking areas (unset / 1: one sequence at a time).
+  if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
+  // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
+  if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+  if (const char* e = getenv("MIN_KV_TOKENS"); e && *e) o.min_kv_tokens = atoi(e);
+  return o;
+}
+
 }  // namespace
 
 namespace q27 {
@@ -119,33 +162,19 @@ void q27t_gdn_probe(long long* out) { q27::gdn_probe_read(out); }
 
 void* q27_create(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir) {
   Model* m = nullptr;
+  guard([&] { m = new Model(engine_options(model_dir, max_tokens, prefill_chunk, kv_fp8, draft_dir)); });
+  return m;
+}
+
+// The memory plan of q27_create(...) on a device with `free` of `total` bytes free after the CUDA context, without
+// CUDA: nothing is allocated or loaded (the checkpoints' headers are read). Ask it with q27_memory_report,
+// q27_max_tokens, q27_cache_stats and q27_device_memory, then q27_destroy it (the stats page's start settings).
+void* q27_plan(const char* model_dir, int max_tokens, int prefill_chunk, int kv_fp8, const char* draft_dir, int64_t free,
+               int64_t total) {
+  Model* m = nullptr;
   guard([&] {
-    Options o;
-    o.model_dir = model_dir;
-    if (draft_dir && *draft_dir) o.draft_dir = draft_dir;
-    if (max_tokens > 0) o.max_tokens = max_tokens;
-    if (prefill_chunk > 0) o.prefill_chunk = prefill_chunk;
-    o.logits_rows = std::min(o.logits_rows, o.prefill_chunk);
-    Q27_CHECK(kv_fp8 >= 0 && kv_fp8 <= 2, "kv type: 0 BF16, 1 FP8, 2 NVFP4");
-    o.kv_type = KvType(kv_fp8);  // (kv_fp8: the KV type code; 1 / true stays FP8)
-    // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
-    // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
-    if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
-    if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
-    if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
-    // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
-    // per request).
-    if (const char* e = getenv("VISION"); e && *e) {
-      const std::string v = e;
-      Q27_CHECK(v == "off" || v == "bf16" || v == "host" || v == "fp8", "VISION: off, bf16, host or fp8");
-      o.vision = v == "bf16" ? 1 : v == "host" ? 2 : v == "fp8" ? 3 : 0;
-    }
-    if (const char* e = getenv("IMAGE_MAX_PIXELS")) o.image_max_pixels = atoi(e);
-    if (const char* e = getenv("IMAGE_TOKENS")) o.image_tokens = atoi(e);
-    // Several sequences (Phase 6): MAX_SEQS - 1 parking areas (unset / 1: one sequence at a time).
-    if (const char* e = getenv("MAX_SEQS"); e && *e) o.park_slots = std::max(0, atoi(e) - 1);
-    // MAX_TOKENS_FIT=1: lower max_tokens to what the VRAM budget fits (q27_max_tokens) instead of failing.
-    if (const char* e = getenv("MAX_TOKENS_FIT"); e && *e) o.fit_max_tokens = atoi(e) != 0;
+    Options o = engine_options(model_dir, max_tokens, prefill_chunk, kv_fp8, draft_dir);
+    o.plan_only = true, o.plan_free = size_t(free), o.plan_total = size_t(total);
     m = new Model(o);
   });
   return m;
@@ -174,17 +203,61 @@ int q27_forward_topk(void* m, const int32_t* ids, int n, int k, int32_t* out_ids
   });
 }
 
-// Runs n tokens and samples the next one (temperature <= 0: greedy).
+// Runs n tokens and samples the next one (temperature <= 0: greedy; presence / frequency: Model::forward_sample;
+// logprobs >= 0: q27_logprobs answers with that many top entries; masked: by row 0 of q27_mask_rows; biased: the
+// running sequence's q27_bias_set list).
 int q27_forward_sample(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, float uniform,
-                       int32_t* out) {
-  return guard([&] { *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform); });
+                       float min_p, float presence, float frequency, int logprobs, int32_t* out, int masked,
+                       int biased) {
+  return guard([&] {
+    *out = static_cast<Model*>(m)->forward_sample(ids, n, temperature, top_k, top_p, uniform, min_p, presence,
+                                                  frequency, logprobs, masked != 0, biased != 0);
+  });
 }
 
-// Speculative decoding: prompt + first token, then steps of 1..8 new tokens (out[8]; returns the count).
+// Grammar masks (Model::mask_rows): the pinned host rows the caller writes; *words per row, *rows of them.
+void* q27_mask_rows(void* m, int* words, int* rows) {
+  *words = Model::kMaskWords, *rows = Model::kMaskRows;
+  return static_cast<Model*>(m)->mask_rows();
+}
+
+// Logprobs of the tokens the last q27_forward_sample / q27_spec_begin / q27_spec_step returned (lane -1), or of
+// lane z of the last q27_spec_step_lanes (Model::logprobs): returns their count (0: none were asked for), lp[16] the
+// tokens' own, top_id / top_lp [16][20] the top entries (the first *top of each are set: as many as were asked for).
+int q27_logprobs(void* m, int lane, int* top, float* lp, int32_t* top_id, float* top_lp) {
+  const Logprobs& l = static_cast<Model*>(m)->logprobs(lane);
+  *top = l.n ? l.top : 0;
+  memcpy(lp, l.lp, sizeof l.lp);
+  memcpy(top_id, l.top_id, sizeof l.top_id);
+  memcpy(top_lp, l.top_lp, sizeof l.top_lp);
+  return l.n;
+}
+
+// The running sequence's logit bias, n (token, value) pairs, and min_tokens' eos_before (Model::bias_set).
+int q27_bias_set(void* m, const int32_t* ids, const float* vals, int n, int eos_before) {
+  return guard([&] { static_cast<Model*>(m)->bias_set(ids, vals, n, eos_before); });
+}
+
+// The running sequence's output so far as its penalty counts (Model::penalty_init).
+int q27_penalty_init(void* m, const int32_t* ids, int n) {
+  return guard([&] { static_cast<Model*>(m)->penalty_init(ids, n); });
+}
+
+// Speculative decoding: prompt + first token, then steps of 1..16 new tokens (out[16]; returns the count). masked: grammar
+// masks (q27_mask_rows, q27_spec_draft); until >= 0: a step ends at that token (SpecSampling::stop[2]); biased: the
+// running sequence's q27_bias_set list; ignore_eos: an end-of-sequence id does not end a step (SpecSampling).
 int q27_spec_begin(void* m, const int32_t* ids, int n, float temperature, int top_k, float top_p, uint64_t seed,
-                   float uniform, int max_new, int32_t* out) {
+                   float uniform, int max_new, float min_p, float presence, float frequency, int logprobs,
+                   int32_t* out, int masked, int until, int biased, int ignore_eos) {
   return guard([&] {
+    Q27_CHECK(logprobs <= kMaxTopLogprobs, "spec_begin: at most 20 top logprobs");
     SpecSampling smp{temperature, top_k, top_p, 0};  // paths 0: Q27_SPEC_PATHS
+    smp.min_p = min_p, smp.pen.presence = presence, smp.pen.frequency = frequency;
+    smp.logprobs = logprobs < 0 ? -1 : logprobs;
+    smp.masked = masked != 0;
+    smp.stop[2] = until;
+    smp.biased = biased != 0;
+    smp.ignore_eos = ignore_eos != 0;
     *out = static_cast<Model*>(m)->spec_begin(ids, n, smp, seed, uniform, max_new);
   });
 }
@@ -200,6 +273,20 @@ int q27_spec_step2(void* m, int32_t* out, int ahead) {
   int n = -1;
   if (int rc = guard([&] { n = static_cast<Model*>(m)->spec_step(out, ahead != 0); }); rc != 0) return rc;
   return n;
+}
+
+// A masked sequence's step, first part (Model::spec_draft): chain[16] (the first q27_spec_block are set) the verify
+// tokens; q27_spec_step verifies.
+int q27_spec_draft(void* m, int32_t* chain) {
+  return guard([&] { static_cast<Model*>(m)->spec_draft(chain); });
+}
+
+// Masks of a decoding sequence from its next step on (Model::spec_set_masked; area -1: the running one).
+int q27_spec_set_block(void* m, int area, int block) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_block(area, block); });
+}
+int q27_spec_set_masked(void* m, int area) {
+  return guard([&] { static_cast<Model*>(m)->spec_set_masked(area); });
 }
 
 // Prompt chunks before q27_forward_sample / q27_spec_begin (*done: tokens run, see Model::prefill).
@@ -221,18 +308,36 @@ int q27_seq_swap(void* m, int area) {
 int q27_seq_drop(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_drop(area); });
 }
+// Device memory lent for video decoding (Model::kv_lend): *id is the loan, or -1 when the pool cannot spare it.
+int q27_kv_lend(void* m, int64_t bytes, int* id) {
+  return guard([&] { *id = static_cast<Model*>(m)->kv_lend(size_t(std::max<int64_t>(0, bytes))); });
+}
+int q27_kv_unlend(void* m, int id) {
+  return guard([&] { static_cast<Model*>(m)->kv_unlend(id); });
+}
+int64_t q27_kv_lent(void* m) { return int64_t(static_cast<Model*>(m)->kv_lent()); }
 int q27_seq_suspend(void* m, int area) {
   return guard([&] { static_cast<Model*>(m)->seq_suspend(area); });
 }
 
 // Batched speculative steps (P6-10, Model::spec_step_lanes): lanes[n] (-1: the running sequence, else a
-// parking area); out [n][8] new tokens, counts [n]. 0, -1 on an error, -2 when the KV pool is full.
+// parking area); out [n][16] new tokens, counts [n]. 0, -1 on an error, -2 when the KV pool is full.
 int q27_max_lanes(void* m) { return static_cast<Model*>(m)->max_lanes(); }
 int q27_spec_step_lanes(void* m, const int32_t* lanes, int n, int32_t* out, int32_t* counts) {
   return guard([&] { static_cast<Model*>(m)->spec_step_lanes(lanes, n, out, counts); });
 }
+// Lanes with masks (Model::spec_draft_lanes): chain [n][16] (lane z's block rows, then -1).
+int q27_spec_draft_lanes(void* m, const int32_t* lanes, int n, int32_t* chain) {
+  return guard([&] { static_cast<Model*>(m)->spec_draft_lanes(lanes, n, chain); });
+}
 
 int q27_has_draft(void* m) { return static_cast<Model*>(m)->has_draft() ? 1 : 0; }
+// Rows of a single sequence's speculative step (the draft block: 8 for DFlash2, up to 16 for DSpine; 0: no draft).
+int q27_spec_block(void* m) { return static_cast<Model*>(m)->spec_block(); }
+// Rows of the block of the step the last q27_spec_step returned (Q27_SPEC_ADAPT: 8 or the draft's block).
+int q27_last_step_block(void* m) { return static_cast<Model*>(m)->last_step_block(); }
+// Rows of lane z's block in the last q27_spec_step_lanes (0: no such lane).
+int q27_last_lane_block(void* m, int z) { return static_cast<Model*>(m)->last_lane_block(z); }
 
 // Speculative counters since the last call: steps, lookup steps, tokens.
 int q27_spec_stats(void* m, int64_t* out) {
@@ -249,20 +354,66 @@ int q27_checkpoint(void* m) {
   return guard([&] { static_cast<Model*>(m)->checkpoint(); });
 }
 
-// out[11]: lookups, hits, prompt tokens, cached tokens, saved, evicted, live checkpoints, free KV pages, pages
-// only checkpoints hold, pool pages, KV pages of a parking area.
+// out[12]: lookups, hits, prompt tokens, cached tokens, saved, evicted, live checkpoints, free KV pages, pages
+// only checkpoints hold, pool pages, KV pages of a parking area, state slots allocated.
 int q27_cache_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->cache_stats(out); });
 }
 
+// Allocates up to n more pinned state slots of the prefix cache (*added: how many; 0 once all are).
+int q27_cache_grow(void* m, int n, int* added) {
+  return guard([&] { *added = static_cast<Model*>(m)->grow_state_cache(n); });
+}
+
+// Memory (stats UI): the pool report (Model::memory_report) copied into buf[0..cap) with a terminating 0;
+// returns its length (call again with a larger buffer when it is >= cap), or -1 on an error.
+int q27_memory_report(void* m, char* buf, int cap) {
+  std::string r;
+  if (guard([&] { r = static_cast<Model*>(m)->memory_report(); }) != 0) return -1;
+  if (cap > 0) {
+    const size_t n = std::min(r.size(), size_t(cap - 1));
+    memcpy(buf, r.data(), n);
+    buf[n] = 0;
+  }
+  return int(r.size());
+}
+
+// out[4]: device bytes free now, total, free when the engine started, VRAM budget of the pools.
+int q27_device_memory(void* m, int64_t* out) {
+  return guard([&] { static_cast<Model*>(m)->device_memory(out); });
+}
+
 // Images (P4-12): spans [n][3] = (start, gh, gw) of the request (after q27_reset / q27_prefix_begin), the
-// vision tower on image i (pixels [4 * gh * gw][1536] fp32), its embeddings [gh * gw][5120] BF16 (tests).
+// vision tower on image i (pixels [4 * gh * gw][1536] fp32, or the resized image [32 * gh][32 * gw][3] uint8
+// with norm = mean[3], std[3]: VisionPixels), its embeddings [gh * gw][5120] BF16 (tests).
 int q27_has_vision(void* m) { return static_cast<Model*>(m)->has_vision() ? 1 : 0; }
 int q27_mm_set(void* m, const int32_t* spans, int n) {
   return guard([&] { static_cast<Model*>(m)->mm_set(spans, n); });
 }
 int q27_mm_encode(void* m, int i, const float* pixels) {
-  return guard([&] { static_cast<Model*>(m)->mm_encode(i, pixels); });
+  return guard([&] {
+    VisionPixels px;
+    px.patches = pixels;
+    static_cast<Model*>(m)->mm_encode(i, &px);
+  });
+}
+int q27_mm_encode_rgb(void* m, int i, const uint8_t* rgb, const float* norm) {
+  return guard([&] {
+    const VisionPixels px = rgb_pixels(rgb, norm);
+    static_cast<Model*>(m)->mm_encode(i, &px);
+  });
+}
+// A video's frame pairs i .. i + n - 1 (spans of one grid): frames [2n] resized frames as in q27_mm_encode_rgb,
+// the pair of span i + k being frames[2k], frames[2k + 1].
+int q27_mm_encode_frames(void* m, int i, int n, const uint8_t* const* frames, const float* norm) {
+  return guard([&] {
+    std::vector<VisionPixels> px(std::max(n, 0));
+    for (int k = 0; k < n; k++) {
+      px[k] = rgb_pixels(frames[2 * k], norm);
+      px[k].rgb2 = frames[2 * k + 1];
+    }
+    static_cast<Model*>(m)->mm_encode(i, px.data(), n);
+  });
 }
 int q27_mm_embeds(void* m, int i, bf16* out) {
   return guard([&] { static_cast<Model*>(m)->mm_embeds(i, out); });
@@ -270,6 +421,41 @@ int q27_mm_embeds(void* m, int i, bf16* out) {
 
 int q27_mm_put(void* m, int i, const bf16* in) {
   return guard([&] { static_cast<Model*>(m)->mm_put(i, in); });
+}
+
+// Videos: the container's video track (no CUDA): out [6] = codec (VideoCodec), width, height (upright: a rotated
+// video's turned), frames, frames
+// per second, frames an edit list leaves out at the start. -3: the file cannot be used (q27_last_error).
+int q27_video_probe(const uint8_t* data, int64_t n, double* out) {
+  return guard([&] {
+    const VideoTrack t = video_demux(data, size_t(n));
+    const double v[6] = {double(t.codec), double(t.display_width()), double(t.display_height()), double(t.frames()),
+                         t.fps, double(t.skip_front)};
+    std::memcpy(out, v, sizeof v);
+  });
+}
+
+// Device memory decoding a video's frames from `first` on to out_w x out_h takes (video_memory; the parser on the
+// CPU, no decoder): out [4] = bytes, sessions, bytes per session, decode surfaces. -3: the file cannot be used.
+int q27_video_memory(const uint8_t* data, int64_t n, int out_w, int out_h, int sessions, int first, double* out) {
+  return guard([&] {
+    const VideoMemory v = video_memory(data, size_t(n), out_w, out_h, sessions, first);
+    const double r[4] = {double(v.bytes), double(v.sessions), double(v.per_session), double(v.surfaces)};
+    std::memcpy(out, r, sizeof r);
+  });
+}
+
+// Frames want[n_want] (ascending) of a video, decoded on NVDEC and resized on the GPU to out_w x out_h (0: their
+// size; PIL's bicubic), as RGB [h][w][3] uint8 into out (host), one after another. sessions: parallel decoders
+// (0: one per NVDEC engine). stats [5] = frames presented, pictures decoded, sessions, setup ms, total ms.
+int q27_video_frames(const uint8_t* data, int64_t n, const int32_t* want, int n_want, int out_w, int out_h, int sessions,
+                     uint8_t* out, double* stats) {
+  return guard([&] {
+    const VideoDecodeStats st = video_frames(data, size_t(n), std::vector<int>(want, want + n_want), out_w, out_h, out,
+                                             sessions);
+    const double v[5] = {double(st.presented), double(st.decoded), double(st.sessions), st.setup_ms, st.total_ms};
+    std::memcpy(stats, v, sizeof v);
+  });
 }
 
 int q27_debug_kv(void* m, int layer, int pos, int n, void* out) {
@@ -289,6 +475,20 @@ int q27_profile_dump(void* m) {
 
 // ---------------------------------------------------------------- kernels (tests)
 
+// The BF16 patches [gh * gw][1536] (out, device) of host pixels: fp32 patches, or with rgb the image and norm.
+int q27t_vision_pixels(const float* patches, const uint8_t* rgb, const float* norm, int gh, int gw, bf16* out) {
+  return kernel([&] {
+    VisionPixels px = rgb ? rgb_pixels(rgb, norm) : VisionPixels{};
+    px.patches = patches;
+    constexpr size_t kTmp = size_t(4) << 20;  // (small: several chunks or bands for the larger test images)
+    static void* tmp = [] {
+      void* x;
+      Q27_CUDA(cudaMalloc(&x, kTmp));
+      return x;
+    }();
+    vision_pixels(px, gh, gw, out, tmp, kTmp, ts());
+  });
+}
 int q27t_rmsnorm(const float* x, const bf16* w, int T, int D, float eps, int zc, float* out) {
   return kernel([&] { rmsnorm(x, w, T, D, eps, zc != 0, out, ts()); });
 }
@@ -328,28 +528,73 @@ int q27t_silu_mul_quant_fp4_bf16(const bf16* g, const bf16* u, int64_t ld, int T
                                  uint8_t* sf) {
   return kernel([&] { silu_mul_quant_fp4(g, u, ld, T, I, in_scale, q, sf, ts()); });
 }
+int q27t_silu_mul_quant_fp4_glu(const float* gu, int T, int I, float ag, float au, float in_scale, uint8_t* q,
+                                uint8_t* sf) {
+  return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
+}
+int q27t_silu_mul_quant_fp4_glu_bf16(const bf16* gu, int T, int I, float ag, float au, float in_scale, uint8_t* q,
+                                     uint8_t* sf) {
+  return kernel([&] { silu_mul_quant_fp4_glu(gu, T, I, ag, au, in_scale, q, sf, ts()); });
+}
 int q27t_gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                       float alpha, bf16* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ws, ws_bytes, ts()); });
+                       float alpha, bf16* d) {
+  return kernel([&] { gemm_fp4_bf16(M, N, K, a, a_sf, b, b_sf, alpha, d, ts()); });
 }
 int q27t_linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* oa, float* ob) {
   return kernel([&] { linear_bf16_pair(x, wa, wb, T, N, K, oa, ob, ts()); });
 }
+// RMSNorm (FP8 activations into q) then in_proj_a / b as the GDN prefill runs them; h: [T][5120] scratch.
+int q27t_norm_linear_bf16_pair(const float* x, const bf16* norm_w, float eps, const bf16* wa, const bf16* wb, int T,
+                               float* h, uint8_t* q, float* oa, float* ob) {
+  return kernel([&] {
+    const bool fused = linear_bf16_pair_norm_ok(T);
+    rmsnorm_quant(x, norm_w, T, eps, fused ? nullptr : h, {QuantOut::kFp8, 1.f, q, nullptr}, ts(), nullptr, 0,
+                  fused ? h : nullptr);
+    if (fused)
+      linear_bf16_pair(x, wa, wb, T, 48, dims::kHidden, oa, ob, ts(), h, norm_w);
+    else
+      linear_bf16_pair(h, wa, wb, T, 48, dims::kHidden, oa, ob, ts());
+  });
+}
 int q27t_swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst) {
   return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts()); });
 }
+int q27t_swizzle_sf_glu(const uint8_t* src, int rows, int kblocks, uint8_t* dst, int half) {
+  return kernel([&] { swizzle_sf(src, rows, kblocks, dst, ts(), half); });
+}
 int64_t q27t_sf_bytes(int64_t rows, int64_t kblocks) { return sf_bytes(rows, kblocks); }
 int q27t_gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                  float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ws, ws_bytes, ts()); });
+                  float alpha, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp4(M, N, K, a, a_sf, b, b_sf, alpha, c, beta, d, ts()); });
+}
+int q27t_gemm_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                      const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                      uint8_t* q_sf) {
+  return kernel([&] { gemm_fp4_glu(M, I, K, a, a_sf, gate_up, gate_up_sf, alpha_gate, alpha_up, out_scale, q, q_sf, ts()); });
 }
 int q27t_gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-                  float* d, void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ws, ws_bytes, ts()); });
+                  float* d) {
+  return kernel([&] { gemm_fp8(M, N, K, a, b, alpha, c, beta, d, ts()); });
 }
-size_t q27t_gemm_workspace_bytes() { return gemm_workspace_bytes(0); }
-int q27t_gemm_workspace_init(void* ws, size_t ws_bytes) {
-  return kernel([&] { gemm_workspace_init(ws, ws_bytes, ts()); });
+int q27t_gemm_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* b,
+                         const float* wscale, const float* c, float beta, float* d) {
+  return kernel([&] { gemm_fp8_scaled(M, N, K, a, ascale, b, wscale, c, beta, d, ts()); });
+}
+int q27t_skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w,
+                           const float* wscale, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
+  return kernel([&] { skinny_fp8_scaled(M, N, K, a, ascale, w, wscale, c, beta, d, ws, ws_bytes, ts()); });
+}
+int q27t_quant_fp8_rows(const float* x, int64_t ld, int T, int K, uint8_t* q, float* scale) {
+  return kernel([&] { quant_fp8_rows(x, ld, T, K, q, scale, ts()); });
+}
+int q27t_silu_mul_quant_fp8_rows(const float* g, const float* u, int64_t ld, int T, int I, uint8_t* q, float* scale) {
+  return kernel([&] { silu_mul_quant_fp8_rows(g, u, ld, T, I, q, scale, ts()); });
+}
+int q27t_rmsnorm_quant_rows(const float* x, const bf16* w, int T, float eps, float* out, uint8_t* q, float* scale) {
+  return kernel([&] { rmsnorm_quant(x, w, T, eps, out, {QuantOut::kFp8Row, 1.f, q, nullptr, scale}, ts()); });
+}
+int q27t_dequant_fp8_rows(const uint8_t* w, const float* scale, int rows, int K, bf16* out) {
+  return kernel([&] { dequant_fp8_rows(w, scale, rows, K, out, ts()); });
 }
 int q27t_skinny_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* w, const uint8_t* w_sf,
                     float alpha, const float* c, float beta, float* d, void* ws, size_t ws_bytes) {
@@ -360,9 +605,9 @@ int q27t_skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, flo
   return kernel([&] { skinny_fp8(M, N, K, a, w, AlphaSegments::one(alpha), c, beta, d, ws, ws_bytes, ts()); });
 }
 // Microbenchmark: average time (us) of `iters` calls, cycling through `nbuf` weight copies spaced
-// w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8;
-// cutlass != 0: the Phase 1 CUTLASS kernel instead.
-int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
+// w_stride / sf_stride bytes apart (to defeat L2). fp4 != 0: skinny_fp4, else skinny_fp8; many != 0: the many-row
+// GEMM (gemm_fp4 / gemm_fp8) instead.
+int q27t_bench_gemm(int fp4, int many, int M, int N, int K, const uint8_t* a, const uint8_t* a_sf,
                     const uint8_t* w, const uint8_t* w_sf, int64_t w_stride, int64_t sf_stride, int nbuf, int iters,
                     float* d, void* ws, size_t ws_bytes, float* us) {
   return kernel([&] {
@@ -372,9 +617,9 @@ int q27t_bench_gemm(int fp4, int cutlass, int M, int N, int K, const uint8_t* a,
     auto run = [&](int i) {
       const uint8_t* wi = w + (i % nbuf) * w_stride;
       const uint8_t* si = w_sf ? w_sf + (i % nbuf) * sf_stride : nullptr;
-      if (fp4 && cutlass) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
+      if (fp4 && many) gemm_fp4(M, N, K, a, a_sf, wi, si, 1.f, nullptr, 0.f, d, ts());
+      else if (many) gemm_fp8(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ts());
       else if (fp4) skinny_fp4(M, N, K, a, a_sf, wi, si, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
-      else if (cutlass) gemm_fp8(M, N, K, a, wi, 1.f, nullptr, 0.f, d, ws, ws_bytes, ts());
       else skinny_fp8(M, N, K, a, wi, AlphaSegments::one(1.f), nullptr, 0.f, d, ws, ws_bytes, ts());
     };
     for (int i = 0; i < std::max(nbuf, iters); i++) run(i);  // warm-up (clocks, L2 state)
@@ -444,6 +689,11 @@ int q27t_skinny_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d
 int q27t_gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float* d) {
   return kernel([&] { gemm_bf16(M, N, K, a, w, 1.f, nullptr, 0.f, d, ts()); });
 }
+// The general form (C, beta).
+int q27t_gemm_bf16_ex(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta,
+                      float* d) {
+  return kernel([&] { gemm_bf16(M, N, K, a, w, alpha, c, beta, d, ts()); });
+}
 // GDN verify of T tokens on one layer: ptrs of the two input buffers (raw, k, v, ab each), the parity and the
 // commit count of the previous verify (device ints).
 int q27t_gdn_verify(const float* qkv, int ld, int T, float* conv_state, const bf16* conv_w, const float* h,
@@ -494,8 +744,10 @@ int q27t_logsoftmax_topk(const float* logits, int T, int V, int k, int32_t* ids,
   return kernel([&] { logsoftmax_topk(logits, T, V, k, ids, logp, ts()); });
 }
 int q27t_sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-                int32_t* out) {
-  return kernel([&] { sample(logits, T, V, temperature, top_k, top_p, uniform, out, ts()); });
+                int32_t* out, float min_p, uint32_t* counts, float presence, float frequency) {
+  return kernel([&] {
+    sample(logits, T, V, temperature, top_k, top_p, uniform, out, ts(), min_p, Penalty{counts, presence, frequency});
+  });
 }
 
 }  // extern "C"

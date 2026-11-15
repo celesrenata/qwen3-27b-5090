@@ -3,16 +3,18 @@ SGLang environments (same port, model name, parsers and request options).
 
 Endpoints: POST /v1/chat/completions, /v1/completions, /v1/responses (Codex), /v1/messages,
 /v1/messages/count_tokens, /tokenize, /detokenize; GET /v1/models, /health, /metrics; GET / POST
-/admin/concurrency (the admission settings, P7-14). Streaming everywhere (SSE), reasoning (`<think>`, returned as
+/admin/concurrency (the admission settings, P7-14); GET / POST /admin/engine (stop, start or restart the engine,
+with other start settings: launch.py), POST /admin/engine/plan (what start settings leave for the context); POST /admin/engine/idle (the unload when idle); GET /ui (live stats in the browser: GPU, VRAM, requests, log;
+/ui/stream is its event stream, /ui/state one snapshot as JSON; stats.py). Streaming everywhere (SSE), reasoning (`<think>`, returned as
 `reasoning_content` / `reasoning`, or Anthropic thinking blocks), tool calls (qwen3_coder XML, streamed call by
-call), images (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
+call), images and videos (data URLs or http(s) URLs; VISION=host | fp8 | bf16).
 
 The engine runs in its own process (worker.py, which schedules up to MAX_SEQS requests at once; how many run
 is decided while it runs: a target number, room in the KV pool, MIN_SEQ_TPS). If it
 dies (a CUDA error), requests in flight fail with 503, /health answers 503 and a new engine is started.
 Requests are cancelled when the client disconnects or a stop string matches.
 
-    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dflash2|none]
+    python frontend/server.py [--port 8000] [--max-tokens 262144] [--kv-dtype nvfp4|fp8|bf16] [--spec dspine|dflash2|none]
 """
 
 import argparse
@@ -37,17 +39,22 @@ sys.path.insert(0, str(ROOT / "frontend"))
 sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
+import structured  # noqa: E402
 import worker  # noqa: E402
-from chat import (STOP_REASON, AnthropicError, OutputParser, _partial_suffix, anthropic_messages,  # noqa: E402,F401
-                  anthropic_template_kwargs, new_id, normalize_messages, openai_call, parse_output,
-                  parse_tool_calls, responses_messages, responses_template_kwargs, split_reasoning,
-                  template_kwargs, thinking_signature)
+from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
+from stats import HUB, request_meta  # noqa: E402
+from chat import (MARKS, STOP_REASON, THINK_END, AnthropicError, OutputParser, _partial_suffix, mark_strings,  # noqa: E402,F401
+                  anthropic_messages, anthropic_template_kwargs, forced_call, new_id, normalize_messages,
+                  openai_call, parse_output, parse_tool_calls, responses_messages, responses_template_kwargs,
+                  split_reasoning, template_kwargs, thinking_signature, tool_choice_of)
 
 MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "qwen3.8-27b")
 DEFAULTS = {"temperature": 1.0, "top_k": 20, "top_p": 0.95}  # generation_config.json of the checkpoint
-SPEC_MARGIN = 8  # a verify block writes up to 8 positions past the committed length
+SPEC_MARGIN = 16  # a verify block writes up to 16 positions past the committed length (DSpine; DFlash2 8)
 KEEPALIVE_S = 10.0
 DUMP_DIR = os.environ.get("API_DUMP_DIR")  # debug: write every POST body there
+UI_PAGE = ROOT / "frontend/ui/index.html"
+GENERATE = ("/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages")
 
 
 def log(msg):
@@ -63,21 +70,59 @@ class ApiError(Exception):
 # ---------------------------------------------------------------- images
 
 
+def video_part(part):
+    """The URL of a content part that is a video (OpenAI-style {"type": "video_url", "video_url": {"url"}}, or
+    {"type": "video", "video": url}), else None."""
+    if not isinstance(part, dict) or not (part.get("type") in ("video", "video_url") or "video" in part
+                                          or "video_url" in part):
+        return None
+    src = part.get("video_url", part.get("video"))
+    return src.get("url") if isinstance(src, dict) else src
+
+
+def with_video_parts(messages):
+    """messages with each video part as {"type": "video", "video": url}, the form the chat template renders as a
+    video (it does not know "video_url")."""
+    out = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list) and any(video_part(p) is not None for p in content):
+            m = dict(m, content=[{"type": "video", "video": video_part(p)} if video_part(p) is not None else p
+                                 for p in content])
+        out.append(m)
+    return out
+
+
 class Images:
-    """Image inputs (P4-12): data URLs (or http(s) URLs) -> pixel_values of the checkpoint's image processor."""
+    """Image and video inputs (P4-12): data URLs (or http(s) URLs) -> the token ids and, for the engine process,
+    the encoded images with their resized size (it decodes only those it has to encode: imageproc.py), and the
+    encoded videos with their plan (videoproc.py: each pair of frames is an image to the language model and the
+    vision tower, after its time as text)."""
 
-    MAX_BYTES = 32 << 20
+    MAX_BYTES = {"image": 32 << 20, "video": 256 << 20}
 
-    def __init__(self, path, max_pixels):
-        from transformers import AutoImageProcessor
+    def __init__(self, path, max_pixels, max_tokens=16384):
+        from imageproc import ImageProcessor
 
-        self.proc = AutoImageProcessor.from_pretrained(path)
+        self.path = path
+        self.proc = ImageProcessor(path)
         self.max_pixels = max_pixels
+        self.max_tokens = max_tokens  # (IMAGE_TOKENS: the engine's embedding rows per request)
+        self._video = None
+
+    @property
+    def video(self):
+        if self._video is None:
+            from videoproc import VideoProcessor
+
+            self._video = VideoProcessor(self.path)
+        return self._video
 
     @staticmethod
     def collect(messages):
-        """The image URLs of the messages, in the order the chat template renders their pads."""
-        urls = []
+        """The (kind, URL) of the images and videos of the messages, in the order the chat template renders their
+        pads."""
+        out = []
         for m in messages:
             content = m.get("content")
             if not isinstance(content, list):
@@ -85,51 +130,95 @@ class Images:
             for part in content:
                 if not isinstance(part, dict):
                     continue
-                if part.get("type") in ("video", "video_url") or "video" in part or "video_url" in part:
-                    raise ApiError(400, "video input is not supported")
-                if "image_url" in part or "image" in part or part.get("type") == "image":
+                if (url := video_part(part)) is not None:
+                    out.append(("video", url))
+                elif "image_url" in part or "image" in part or part.get("type") == "image":
                     src = part.get("image_url", part.get("image"))
-                    urls.append(src.get("url") if isinstance(src, dict) else src)
-        return urls
+                    out.append(("image", src.get("url") if isinstance(src, dict) else src))
+        return out
 
-    def load(self, url):
+    def load(self, url, kind="image"):
+        """(encoded bytes, size): the image's (width, height), or the video's (frames, fps, width, height)."""
         import io
 
         from PIL import Image
 
+        limit = self.MAX_BYTES[kind]
         if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
             raw = base64.b64decode(url.split(";base64,", 1)[1])
         elif isinstance(url, str) and url.startswith(("http://", "https://")):
             try:
-                with urllib.request.urlopen(url, timeout=30) as r:
-                    raw = r.read(self.MAX_BYTES + 1)
+                with urllib.request.urlopen(url, timeout=30 if kind == "image" else 120) as r:
+                    raw = r.read(limit + 1)
             except Exception as e:  # noqa: BLE001 - any fetch error is the client's
-                raise ApiError(400, f"cannot fetch image {url}: {e}") from e
-            if len(raw) > self.MAX_BYTES:
-                raise ApiError(400, "image larger than 32 MiB")
+                raise ApiError(400, f"cannot fetch {kind} {url}: {e}") from e
         else:
-            raise ApiError(400, "images must be data URLs (data:image/...;base64,...) or http(s) URLs")
+            raise ApiError(400, f"{kind}s must be data URLs (data:{kind}/...;base64,...) or http(s) URLs")
+        if len(raw) > limit:
+            raise ApiError(400, f"{kind} larger than {limit >> 20} MiB")
         try:
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            if kind == "video":
+                from videoproc import probe
+
+                return raw, probe(raw)
+            with Image.open(io.BytesIO(raw)) as img:  # (the header only)
+                return raw, img.size
         except Exception as e:  # noqa: BLE001 - any decoder error is the client's
-            raise ApiError(400, f"cannot decode image: {e}") from e
-        return raw, img
+            raise ApiError(400, f"cannot decode {kind}: {e}") from e
 
-    def prepare(self, ids, urls, pad_id):
-        """(ids with each image's pad expanded to its token ids, [(start, gh, gw)], [pixel_values per image])."""
-        from qwen27b.vision import expand_image_pads, image_token_ids
+    def prepare(self, ids, media, pads, encode, video_options=None):
+        """(ids with each image's and video's pad expanded, [(start, gh, gw)] per image and pair of video frames,
+        [source per span], [(encoded video, videoproc.Plan) per video]). The source of an image's span is
+        ("image", encoded image, resized (width, height), norm) for imageproc.rgb and q27_mm_encode_rgb, of a
+        video's pair ("video", video index, pair index, norm). pads: the ids of <|image_pad|>, <|video_pad|>,
+        <|vision_start|>, <|vision_end|>; encode(text) -> ids (the pairs' times). video_options: the request's
+        (videoproc.options_of)."""
+        import hashlib
 
-        raws, imgs = zip(*(self.load(u) for u in urls))
-        batch = self.proc(images=list(imgs), size={"shortest_edge": 65536, "longest_edge": self.max_pixels},
-                          return_tensors="np")
-        grids = batch["image_grid_thw"].tolist()
-        keys = [raw + repr((g, self.max_pixels)).encode() for raw, g in zip(raws, grids)]
-        ids, spans = expand_image_pads(ids, grids, pad_id, fill=lambda i, n: image_token_ids(keys[i], n))
-        pv, out, r = batch["pixel_values"], [], 0
-        for t, h, w in grids:
-            out.append(pv[r:r + t * h * w])
-            r += t * h * w
-        return ids, [(s.start, s.gh, s.gw) for s in spans], out
+        from qwen27b.image_tokens import image_token_ids
+
+        image_pad, video_pad, vstart, vend = pads
+        loaded = [(kind, *self.load(u, kind)) for kind, u in media]
+        out, spans, srcs, videos, k = [], [], [], [], 0
+        for t in ids:
+            if t not in (image_pad, video_pad) or k >= len(loaded):
+                out.append(t)
+                continue
+            kind, raw, size = loaded[k]
+            if (kind == "video") != (t == video_pad):
+                raise ApiError(400, "the images and videos do not match the prompt's pads")
+            k += 1
+            if kind == "image":
+                rsize = self.proc.size(size, self.max_pixels)
+                _, gh, gw = self.proc.grid(rsize)
+                n = gh * gw // 4
+                spans.append((len(out), gh // 2, gw // 2))
+                srcs.append(("image", raw, rsize, self.proc.norm))
+                out.extend(image_token_ids(raw + repr(([1, gh, gw], self.max_pixels)).encode(), n))
+                continue
+            try:
+                plan = self.video.plan(*size, frame_pixels=self.max_pixels, options=video_options)
+            except ValueError as e:
+                raise ApiError(400, f"cannot use the video: {e}") from e
+            pairs, gh, gw = plan.grid
+            n = gh * gw // 4
+            digest = hashlib.sha256(raw).digest()
+            for g in range(pairs):
+                out.extend(encode(f"<{plan.times[g]:.1f} seconds>"))
+                out.append(vstart)
+                spans.append((len(out), gh // 2, gw // 2))
+                srcs.append(("video", len(videos), g, self.video.norm))
+                # (the pair's own frames: plans of other options may share the grid)
+                pair = plan.indices[2 * g:2 * g + 2]
+                out.extend(image_token_ids(digest + repr((plan.grid, plan.size, g, pair)).encode(), n))
+                out.append(vend)
+            videos.append((raw, plan))
+        if k != len(loaded):
+            raise ApiError(400, f"{len(loaded)} images and videos for {k} pads in the prompt")
+        if (rows := sum(gh * gw for _, gh, gw in spans)) > self.max_tokens:
+            raise ApiError(400, f"the images and videos take {rows} tokens, more than IMAGE_TOKENS ({self.max_tokens}; "
+                                "the server's setting)")
+        return out, spans, srcs, videos
 
 
 # ---------------------------------------------------------------- the engine process
@@ -137,10 +226,18 @@ class Images:
 
 class EngineClient:
     """Starts the engine process (worker.py) and routes its messages to the requests' queues; starts a new
-    one when it dies."""
+    one when it dies. The engine holds all the VRAM: control() stops it (the server stays up and answers 503),
+    starts it again or restarts it (POST /admin/engine, the stats page). With idle_unload (seconds, 0: off) it also
+    stops after that long without a request, and the next request starts it and waits for it."""
 
-    def __init__(self, cfg):
+    LOAD_WAIT_S = 300  # how long a request waits for the engine it started (idle_unload)
+
+    def __init__(self, cfg, autostart=True, idle_unload=0.0):
         self.cfg = cfg
+        self.idle_unload = self.idle_unload_at_start = idle_unload
+        self.on_demand = None              # after an idle unload: "unloaded", then "loading" until ready (else None)
+        self.last_active = time.monotonic()
+        self.refused = None                # (time, why) of the last load that found too little VRAM (idle_unload)
         self.lock = threading.Lock()       # handles
         self.send_lock = threading.Lock()  # (a Connection is not thread-safe)
         self.handles = {}
@@ -152,19 +249,112 @@ class EngineClient:
         self.config_answers = {}           # change number -> the worker's settings after it
         self.config_n = 0
         self.restarts = 0
-        self.stopping = False
-        self.start()
+        self.stopping = False              # the server is shutting down
+        self.wanted = autostart            # the engine should run (stopped from the admin API: False)
+        self.life = threading.Lock()       # start / stop / restart, one at a time
+        self.gen = 0                       # engine generation (a stop or start makes a pending auto-restart stale)
+        self.proc = None
+        if autostart:
+            self.start()
+        elif idle_unload > 0:  # (no VRAM in use until the first request, as after an idle unload)
+            self.on_demand = "unloaded"
+            HUB.engine_state_set("stopped", "engine not loaded (the first request loads it)")
+        else:
+            HUB.engine_state_set("stopped", "engine not started (ENGINE_AUTOSTART=0)")
+        threading.Thread(target=self.idle_watch, daemon=True, name="engine-idle").start()
 
     def start(self):
+        free = HUB.device_free_now()
+        HUB.engine_starting()
+        cfg = dict(self.cfg, env=dict(self.cfg.get("env", {}), Q27_DEVICE_FREE_BYTES=None if free is None else str(free)))
         ctx = mp.get_context("spawn")
         parent, child = ctx.Pipe()
-        self.proc = ctx.Process(target=worker.run, args=(child, self.cfg), daemon=True, name="q27-engine")
+        self.proc = ctx.Process(target=worker.run, args=(child, cfg), daemon=True, name="q27-engine")
         self.proc.start()
         child.close()
         self.conn = parent
-        threading.Thread(target=self.reader, daemon=True, name="engine-reader").start()
+        threading.Thread(target=self.reader, args=(self.gen,), daemon=True, name="engine-reader").start()
 
-    def reader(self):
+    def state(self):
+        """stopped | loading | ready | restarting (after a crash) | stopping."""
+        return HUB.engine_state
+
+    def control(self, action):
+        """start | stop | restart the engine process; returns the state afterwards (start: "loading")."""
+        with self.life:
+            if action != "start" or self.on_demand == "unloaded":
+                self.on_demand = None  # (a stop from the admin API stays until a start from it)
+            if action in ("stop", "restart"):
+                self._stop()
+            if action in ("start", "restart") and not (self.proc is not None and self.proc.is_alive()):
+                self.wanted, self.restarts = True, 0
+                self.gen += 1
+                self.start()
+        return self.state()
+
+    def idle_watch(self):
+        """Stops the engine after idle_unload seconds without a request. The decision is taken under self.lock, as
+        submit() hands a request over, so that no request goes to an engine that is stopping."""
+        while not self.stopping:
+            time.sleep(min(1.0, self.idle_unload or 1.0))
+            with self.life:
+                with self.lock:
+                    if (self.stopping or self.idle_unload <= 0 or not self.ready.is_set() or self.on_demand or self.handles
+                            or time.monotonic() - self.last_active < self.idle_unload):
+                        continue
+                    self.on_demand = "unloaded"
+                HUB.add_log("admin", None, f"no request for {self.idle_unload:g} s: unloading the engine "
+                                           "(the next request loads it)")
+                self._stop()
+
+    def set_idle_unload(self, seconds):
+        """Changes the time without a request before an unload (0: off); the time runs from now."""
+        with self.lock:
+            self.idle_unload, self.last_active = seconds, time.monotonic()
+
+    def idle_state(self):
+        """For the stats page. unload_in: seconds until an unload, None if none is coming (off, loading, in use)."""
+        unload_in = None
+        if self.idle_unload > 0 and self.ready.is_set() and not self.on_demand and not self.handles:
+            unload_in = max(0.0, self.idle_unload - (time.monotonic() - self.last_active))
+        refused = self.refused
+        return {"idle_unload_s": self.idle_unload, "unloaded": self.on_demand == "unloaded", "unload_in": unload_in,
+                "refused": refused[1] if refused else None}
+
+    def wake(self):
+        """Starts the engine after an idle unload (the first request that needs it; the others wait with it)."""
+        with self.life:
+            if self.on_demand == "unloaded":
+                self.on_demand = "loading"
+                self.wanted, self.restarts = True, 0
+                self.gen += 1
+                HUB.add_log("admin", None, "a request is loading the engine")
+                self.start()
+
+    def _stop(self):
+        self.wanted = False
+        self.gen += 1
+        proc = self.proc
+        if proc is None or not proc.is_alive():
+            HUB.engine_state_set("stopped", "engine stopped")
+            return
+        HUB.engine_state_set("stopping", "stopping the engine")
+        if self.ready.is_set():  # (while loading it reads no messages)
+            try:
+                with self.send_lock:
+                    self.conn.send(("stop",))
+            except OSError:
+                pass
+            proc.join(timeout=15)
+        for kill in (proc.terminate, proc.kill):
+            if proc.is_alive():
+                kill()
+                proc.join(timeout=10)
+        self.ready.clear()
+        log(f"engine stopped (exit code {proc.exitcode})")
+        HUB.engine_state_set("stopped", "engine stopped: its VRAM is free")
+
+    def reader(self, gen):
         conn = self.conn
         try:
             while True:
@@ -172,8 +362,17 @@ class EngineClient:
                 kind = msg[0]
                 if kind == "ready":
                     self.info = msg[1]
+                    self.last_active = time.monotonic()
+                    self.on_demand = self.refused = None
                     self.ready.set()
                     log(f"engine ready: {self.info}")
+                    HUB.engine_ready(self.info, self.cfg)
+                elif kind == "memory":
+                    HUB.set_memory(msg[1])
+                elif kind == "stats":
+                    HUB.set_snapshot(msg[1])
+                elif kind == "event":
+                    HUB.event(msg[1], msg[2], msg[3])
                 elif kind == "metrics":
                     self.metrics.update(msg[1])
                 elif kind == "config":
@@ -184,40 +383,74 @@ class EngineClient:
                         self.config_seen.notify_all()
                 elif kind == "fatal":
                     log(f"engine failed: {msg[1]}")
+                elif kind == "refused":
+                    log(f"engine did not start: {msg[1]}")
+                    if self.idle_unload > 0 or self.on_demand:  # (no retries: the next request tries again; else as for a crash)
+                        self.wanted, self.refused = False, (time.monotonic(), msg[1])
+                        self.on_demand = "unloaded"
+                        HUB.engine_state_set("stopped", msg[1])
                 else:
                     rid = msg[1]
                     if kind == "done":
                         self.metrics.update(msg[3].pop("metrics", {}))
+                        HUB.finished(rid, msg[2], msg[3])
+                    elif kind == "error":
+                        HUB.failed(rid, msg[2])
                     with self.lock:
                         q = self.handles.get(rid)
                         if kind in ("done", "error"):
                             self.handles.pop(rid, None)
+                            self.last_active = time.monotonic()
                     if q is not None:
                         q.put(msg)
         except (EOFError, OSError):
             pass
         self.ready.clear()
+        planned = self.stopping or not self.wanted or gen != self.gen
         with self.lock:
             handles, self.handles = self.handles, {}
         for q in handles.values():
-            q.put(("error", None, "the engine stopped; it is restarting", 503))
-        if self.stopping:
+            q.put(("error", None, "the engine was stopped" if planned else "the engine stopped; it is restarting", 503))
+        if planned:
             return
+        self.on_demand = None  # (after a crash, as without idle_unload: 503 until the new engine is ready)
         self.proc.join(timeout=10)
         code = self.proc.exitcode
         self.restarts += 1
         delay = min(60, 2 ** min(self.restarts, 6))
         log(f"engine exited with code {code}; starting a new one in {delay} s")
+        HUB.engine_stopped(f"engine exited with code {code}; starting a new one in {delay} s")
         time.sleep(delay)
-        self.start()
+        with self.life:
+            if self.wanted and gen == self.gen and not self.stopping:
+                self.start()
+
+    def not_ready(self):
+        if not self.wanted:
+            return ApiError(503, "the engine is stopped (start it at /ui or with POST /admin/engine)", "overloaded_error")
+        return ApiError(503, "the engine is loading", "overloaded_error")
 
     def submit(self, req):
-        if not self.ready.is_set():
-            raise ApiError(503, "the engine is loading", "overloaded_error")
         rid = new_id("req-", 16)
         q = queue.Queue()
-        with self.lock:
-            self.handles[rid] = q
+        arrival = time.monotonic()
+        deadline = arrival + self.LOAD_WAIT_S
+        while True:
+            with self.lock:
+                self.last_active = time.monotonic()
+                on_demand = self.on_demand
+                if self.ready.is_set() and on_demand != "unloaded":
+                    self.handles[rid] = q
+                    break
+            if not on_demand:
+                raise self.not_ready()
+            if on_demand == "unloaded":
+                if self.refused and self.refused[0] >= arrival:  # (the load this request waited for)
+                    raise ApiError(503, self.refused[1], "overloaded_error")
+                self.wake()
+            if time.monotonic() > deadline:
+                raise ApiError(503, "the engine is loading", "overloaded_error")
+            self.ready.wait(0.2)
         try:
             with self.send_lock:
                 self.conn.send(("submit", rid, req))
@@ -225,12 +458,13 @@ class EngineClient:
             with self.lock:
                 self.handles.pop(rid, None)
             raise ApiError(503, "the engine is restarting", "overloaded_error") from e
+        HUB.submitted(rid)
         return rid, q
 
     def configure(self, changes):
         """Changes the admission settings (kept for a restarted engine); returns the worker's settings."""
         if not self.ready.is_set():
-            raise ApiError(503, "the engine is loading", "overloaded_error")
+            raise self.not_ready()
         self.cfg.update(changes)
         with self.config_seen:
             self.config_n += 1
@@ -256,6 +490,8 @@ class EngineClient:
 
     def stop(self):
         self.stopping = True
+        if self.proc is None:
+            return
         try:
             with self.send_lock:
                 self.conn.send(("stop",))
@@ -284,47 +520,96 @@ def client_gone(sock):
 
 
 class Detokenizer:
-    """Incremental detokenization: text is released only at complete UTF-8 characters."""
+    """Incremental detokenization: text is released only at complete UTF-8 characters. marks: {token string:
+    character} of tokens written as that character (chat.MARKS, for the output parser)."""
 
-    def __init__(self, tok, lock):
+    def __init__(self, tok, lock, marks=None):
         self.tok, self.lock = tok, lock
         self.ids, self.prefix, self.read = [], 0, 0
+        self.marks = {tok.token_id(k): v for k, v in (marks or {}).items() if tok.token_id(k) is not None}
+        self.literal = set(self.marks.values())
 
     def _decode(self, ids):
         with self.lock:
-            return self.tok.decode(ids, skip_special_tokens=False)
+            return self.tok.decode(ids)
 
     def add(self, ids, final=False):
+        if not self.marks or not any(t in self.marks for t in ids):
+            return self._add(ids, final)
+        out, run = "", []
+        for t in ids:
+            if t not in self.marks:
+                run.append(t)
+                continue
+            # (a marked token ends the text before it: bytes left incomplete there decode as U+FFFD, as in a
+            # decode of the whole)
+            out += self._add(run, final=True) + self.marks[t]
+            self.ids, self.prefix, self.read, run = [], 0, 0, []
+        return out + self._add(run, final)
+
+    def _add(self, ids, final=False):
         self.ids += ids
         prefix_text = self._decode(self.ids[self.prefix:self.read])
         new_text = self._decode(self.ids[self.prefix:])
         if len(new_text) > len(prefix_text) and (final or not new_text.endswith("�")):
             self.prefix, self.read = self.read, len(self.ids)
-            return new_text[len(prefix_text):]
+            text = new_text[len(prefix_text):]
+            if self.marks and any(c in self.literal for c in text):
+                # (the mark characters themselves, plane-16 private use, as text: U+FFFD, so they never split)
+                text = "".join("\ufffd" if c in self.literal else c for c in text)
+            return text
         return ""
 
 
 class Generation:
     """One request on the engine. Iterating yields text pieces; afterwards finish ("stop" | "length"),
     stop_sequence, usage and timings are set. Stop strings are matched here (text that may still start one
-    is held back) and cancel the request; so does a closed connection (ClientGone)."""
+    is held back) and cancel the request; so does a closed connection (ClientGone).
 
-    def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None):
+    With sampling["logprobs"] >= 0 the engine sends each token's logprobs: take_logprobs() gives those of the tokens
+    whose text has been yielded so far (a token is out with the piece its text starts in; the tokens of a stop string
+    that cut the text are not), as (text offset, token id, logprob, [(id, logprob)])."""
+
+    def __init__(self, server, ids, max_new, sampling, stop=(), images=None, sock=None, keepalive=None, force=None,
+                 grammar=None, marked=False):
         self.server, self.sock, self.keepalive = server, sock, keepalive
-        self.stops = [s for s in stop if s]
+        # marked (the chat APIs): the text has the output parser's marker tokens as chat.MARKS. A stop string then
+        # matches both where the model wrote the markers as tokens and where it wrote them as text.
+        stop = [s for s in stop if s]
+        self.stop_of = {s: s for s in stop}
+        if marked:
+            self.stop_of.update({mark_strings(s): s for s in stop})
+        self.stops = list(self.stop_of)
         self.prompt_tokens = len(ids)
         self.finish, self.stop_sequence, self.cached = None, None, 0
-        self.tokens = 0
-        req = dict(ids=ids, max_new=max_new, images=images, **sampling)
+        self.tokens, self.timings = 0, None
+        # For _stopped_timings: the last "prefilled" info, (arrival time, tokens) of the prefill's "tok" and those after
+        # it, and when the first token came.
+        self.prefilled, self.toks, self.first_tok, self.drafts = None, [], None, None
+        req = dict(ids=ids, max_new=max_new, images=images, force=force, **(grammar or {}), **sampling)
+        self.sampling_logprobs = sampling.get("logprobs", -1)
+        # (ignore_eos: the end-of-sequence tokens count and have logprobs, but their text is left out, as vLLM's
+        # skip_special_tokens does)
+        self.hide = set(getattr(server.engine, "cfg", {}).get("eos", ())) if sampling.get("ignore_eos") else set()
         self.rid, self.q = server.engine.submit(req)
-        self.detok = Detokenizer(server.tok, server.tok_lock)
+        self.detok = Detokenizer(server.tok, server.tok_lock, MARKS if marked else None)
         self.text, self.sent = "", 0
+        self.lps, self.lp_taken, self.lp_all = [], 0, False
 
     def cancel(self):
         self.server.engine.cancel(self.rid)
 
+    def take_logprobs(self):
+        """The logprobs of the tokens whose text is out since the last call (see the class)."""
+        n = self.lp_taken
+        while n < len(self.lps) and (self.lp_all or self.lps[n][0] < self.sent):
+            n += 1
+        out, self.lp_taken = self.lps[self.lp_taken:n], n
+        return out
+
     def _release(self, final=False):
         """The text that is safe to send (not possibly the start of a stop string)."""
+        cut = False
         if self.stops:
             start = max(0, self.sent - max(map(len, self.stops)))
             hits = [(self.text.find(s, start), s) for s in self.stops]
@@ -332,12 +617,14 @@ class Generation:
             if hits:
                 i, s = min(hits)
                 self.text = self.text[:i]
-                self.finish, self.stop_sequence = "stop", s
+                self.finish, self.stop_sequence = "stop", self.stop_of[s]
                 self.cancel()
-                final = True
+                final = cut = True
             safe = len(self.text) if final else len(self.text) - (max(map(len, self.stops)) - 1)
         else:
             safe = len(self.text)
+        if final and not cut:
+            self.lp_all = True
         if safe > self.sent:
             piece, self.sent = self.text[self.sent:safe], safe
             return piece
@@ -361,9 +648,20 @@ class Generation:
                 kind = msg[0]
                 if kind == "start":
                     self.cached = msg[2]["cached"]
+                elif kind == "prefilled":
+                    self.prefilled, self.toks = msg[2], self.toks[-1:]  # (it follows the prefill's token)
+                elif kind == "drafts":  # (the worker's counts so far, before the step's "tok")
+                    self.drafts = (msg[2], msg[3])
                 elif kind == "tok":
                     self.tokens += len(msg[2])
-                    self.text += self.detok.add(msg[2])
+                    self.toks.append((time.time(), len(msg[2])))
+                    self.first_tok = self.first_tok or self.toks[-1][0]
+                    if len(msg) > 3:  # (per token: where its text starts)
+                        for t, (lp, top) in zip(msg[2], msg[3]):
+                            self.lps.append((len(self.text), t, lp, top))
+                            self.text += self.detok.add([] if t in self.hide else [t])
+                    else:
+                        self.text += self.detok.add([t for t in msg[2] if t not in self.hide])
                     piece = self._release()
                     if piece:
                         last = time.time()
@@ -380,16 +678,57 @@ class Generation:
                 elif kind == "error":
                     raise ApiError(msg[3] if len(msg) > 3 else 500, msg[2],
                                    "overloaded_error" if (len(msg) > 3 and msg[3] == 503) else "api_error")
+            if self.timings is None:
+                self._stopped_timings()
         except BaseException:
             if self.finish is None:
                 self.cancel()
             raise
+
+    def _stopped_timings(self):
+        """A stop string ended the request. The engine's report follows the cancel only after its next step, which
+        the response does not wait for (a closed-loop client would lose that much decode time per request): the
+        timings are the prompt side the engine sent after the prefill ("prefilled") and the verify steps since then,
+        one "tok" each, timed here."""
+        p, toks = self.prefilled, self.toks
+        if p is None or not toks:
+            return
+        steps = len(toks) - 1  # (the first is the prefill's token)
+        accepted = sum(n for _, n in toks[1:]) - steps if p["draft_block"] else 0  # (a step: accepted drafts + 1)
+        self.timings = {"computed_tokens": p["computed_tokens"], "prefill_s": p["prefill_s"], "ttft": p["ttft"],
+                        "total": p["ttft"] + toks[-1][0] - self.first_tok,
+                        "drafted": p["drafted"] + steps * p["draft_block"], "draft_accepted": p["draft_accepted"] + accepted}
+        if self.drafts:  # (exact: the steps' own block lengths)
+            self.timings["drafted"], self.timings["draft_accepted"] = self.drafts
 
     @property
     def usage(self):
         return {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.tokens,
                 "total_tokens": self.prompt_tokens + self.tokens,
                 "prompt_tokens_details": {"cached_tokens": self.cached}}
+
+    @property
+    def timing_fields(self):
+        """llama.cpp's `timings` object as response fields ({} without the engine's report). As there,
+        prompt_n + cache_n is the whole prompt and predicted_per_second is predicted_n / predicted_ms. The prompt
+        rates use the tokens really prefilled: a preempted request prefills more than prompt_n."""
+        t = self.timings
+        if t is None:
+            return {}
+        computed, prompt_ms = t["computed_tokens"], t["prefill_s"] * 1000
+        n, predicted_ms = self.tokens, (t["total"] - t["ttft"]) * 1000 if t["ttft"] is not None else 0.0
+        rated = n > 1 and predicted_ms > 0  # (one token: no time to rate it over)
+        drafts = {"draft_n": t["drafted"], "draft_n_accepted": t["draft_accepted"]} if t.get("drafted") else {}
+        return {"timings": {
+            "cache_n": self.cached,
+            "prompt_n": max(self.prompt_tokens - self.cached, 0),
+            "prompt_ms": prompt_ms,
+            "prompt_per_token_ms": prompt_ms / computed if computed else 0.0,
+            "prompt_per_second": computed * 1000 / prompt_ms if prompt_ms > 0 else 0.0,
+            "predicted_n": n,
+            "predicted_ms": predicted_ms,
+            "predicted_per_token_ms": predicted_ms / n if rated else 0.0,
+            "predicted_per_second": n * 1000 / predicted_ms if rated else 0.0, **drafts}}
 
 
 # ---------------------------------------------------------------- HTTP
@@ -398,38 +737,104 @@ class Generation:
 class Server:
     """What the handlers share: the engine client, tokenizer, images, limits."""
 
-    def __init__(self, engine, tok, max_tokens, images, thinking_default=True):
-        self.engine, self.tok, self.images = engine, tok, images
+    def __init__(self, engine, tok, max_tokens, launch, thinking_default=True):
+        self.engine, self.tok, self.launch = engine, tok, launch
         self.tok_lock = threading.Lock()
+        self.images_lock = threading.Lock()
+        self._images = None
         self.max_tokens_conf = max_tokens
         self.thinking_default = thinking_default
-        self.pad_id = tok.convert_tokens_to_ids("<|image_pad|>")
+        self.pads = tuple(tok.token_id(t) for t in ("<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"))
+
+    @property
+    def vocab(self):
+        """Token ids the tokenizer knows (logit_bias)."""
+        return self.tok.tok.get_vocab_size(with_added_tokens=True)
 
     @property
     def max_tokens(self):
         """The engine's context capacity (MAX_TOKENS, lowered to what the VRAM fits; MAX_TOKENS_FIT)."""
         return self.engine.info.get("max_tokens", self.max_tokens_conf)
 
+    @property
+    def images(self):
+        """The image processor while the engine is set up with the vision tower (made when first needed)."""
+        cfg = self.engine.cfg
+        if cfg["env"]["VISION"] == "off":
+            return None
+        with self.images_lock:
+            if self._images is None:
+                self._images = Images(cfg["model"], int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)),
+                                      int(os.environ.get("IMAGE_TOKENS", 16384)))
+            return self._images
+
     def encode(self, text):
         with self.tok_lock:
-            return self.tok(text, add_special_tokens=False).input_ids
+            return self.tok.encode(text)
 
-    def render(self, messages, tools, kwargs):
-        """Prompt ids (images expanded) and the images, of chat messages."""
+    def use_template_of(self, weights):
+        """Renders prompts with the chat template of `weights` from here on (an engine start on them; their tokenizer
+        has the server's ids, Launch.weights_choices). The tokenizer itself stays the server's."""
+        from tokenizer import Tokenizer
+
+        path = model_dir(weights)
+        if path == self.tok.template_path:
+            return
+        tok = Tokenizer(self.tok.path, template=path)
+        with self.tok_lock:
+            self.tok = tok
+
+    def render(self, messages, tools, kwargs, video=None):
+        """Prompt ids (images and videos expanded) and the images, of chat messages. Special tokens' strings in what
+        the client wrote stay text (Tokenizer.prompt_ids): only the template opens and ends turns, and places
+        images and videos."""
+        messages = with_video_parts(messages)
         try:
             with self.tok_lock:
-                prompt = self.tok.apply_chat_template(messages, tools=tools or None, add_generation_prompt=True,
-                                                      tokenize=False, **kwargs)
+                ids = self.tok.prompt_ids(messages, tools=tools or None, **kwargs)
         except Exception as e:  # noqa: BLE001 - template errors (no user message, bad roles) are the client's
             raise ApiError(400, f"chat template: {e}") from e
-        ids = self.encode(prompt)
-        urls, images = Images.collect(messages), None
-        if urls:
-            if self.images is None:
-                raise ApiError(400, "this server does not take images (start it with VISION=host, fp8 or bf16)")
-            ids, spans, pixels = self.images.prepare(ids, urls, self.pad_id)
-            images = (spans, pixels)
+        media, images = Images.collect(messages), None
+        if media:
+            proc = self.images
+            if proc is None:
+                raise ApiError(400, "this server does not take images or videos (start the engine with VISION=host, "
+                                    "fp8 or bf16)")
+            try:
+                from videoproc import options_of
+
+                opts = options_of(video, proc.video.max_frames)
+            except ValueError as e:
+                raise ApiError(400, str(e)) from e
+            ids, spans, srcs, videos = proc.prepare(ids, media, self.pads, self.encode, opts)
+            images = (spans, srcs, videos)
         return ids, images
+
+    def force(self, choice, thinking):
+        """The worker's forced output of a tool choice ((mode, name), chat.tool_choice_of), or None: the start of a
+        call, at the start of the answer, or with thinking after the reasoning's end (`</think>`, then a blank line
+        as the template renders it)."""
+        text = forced_call(*choice)
+        if text is None:
+            return None
+        if not thinking:
+            return (None, self.encode(text))
+        return (self.tok.token_id(THINK_END), self.encode("\n\n" + text))
+
+    def constrain(self, fmt, choice, tools, thinking):
+        """The worker's grammar of an output format ((what, value), structured.*_format; None: free text), or None. It
+        applies after the reasoning; while the model may call tools (tool_choice auto) it may call them instead. A
+        forced tool call has no format."""
+        try:
+            spec = fmt()
+            if spec is None or choice[0] in ("required", "named"):
+                return None
+            calls = ((self.tok.token_id("<tool_call>"), self.tok.token_id("</tool_call>"))
+                     if tools and choice[0] == "auto" else None)
+            g = structured.grammar(spec, lead_ws=thinking, calls=calls)
+        except ValueError as e:
+            raise ApiError(400, str(e)) from None
+        return {"grammar": g, "grammar_after": self.tok.token_id(THINK_END) if thinking else None}
 
     def limit(self, n_prompt, anthropic=False):
         left = self.max_tokens - n_prompt - SPEC_MARGIN
@@ -441,13 +846,119 @@ class Server:
         return left
 
 
+MAX_LOGPROBS = 20  # (kMaxTopLogprobs)
+
+
 def sampling_of(body, top_k_key="top_k"):
     temp = body.get("temperature")
     top_p = body.get("top_p")
     top_k = body.get(top_k_key)
+    extra = {}
+    for key, lo, hi in (("min_p", 0.0, 1.0), ("presence_penalty", -2.0, 2.0), ("frequency_penalty", -2.0, 2.0)):
+        v = body.get(key)
+        try:
+            v = 0.0 if v is None else float(v)
+        except (TypeError, ValueError):
+            raise ApiError(400, f"{key}: a number is required") from None
+        if not lo <= v <= hi:
+            raise ApiError(400, f"{key}: must be in [{lo:g}, {hi:g}], got {v:g}")
+        extra[key] = v
     return {"temperature": float(DEFAULTS["temperature"] if temp is None else temp),
             "top_k": int(DEFAULTS["top_k"] if top_k is None else top_k) if (top_k is None or top_k >= 0) else 0,
-            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed")}
+            "top_p": float(DEFAULTS["top_p"] if top_p is None else top_p), "seed": body.get("seed"), **extra}
+
+
+MAX_BIAS = 300  # (OpenAI's limit, kMaxBias)
+
+
+def token_controls_of(body, vocab, max_new):
+    """OpenAI's logit_bias ({token id: -100..100}, at most 300) and vLLM's min_tokens / ignore_eos, as the request's
+    sampling entries (only those it sets)."""
+    out = {}
+    bias = body.get("logit_bias")
+    if bias is not None:
+        if not isinstance(bias, dict):
+            raise ApiError(400, "logit_bias: an object of token ids to values is required")
+        if len(bias) > MAX_BIAS:
+            raise ApiError(400, f"logit_bias: at most {MAX_BIAS} entries, got {len(bias)}")
+        parsed = {}
+        for k, v in bias.items():
+            try:
+                t = int(k)
+            except (TypeError, ValueError):
+                raise ApiError(400, f"logit_bias: {k!r} is not a token id") from None
+            if not 0 <= t < vocab:
+                raise ApiError(400, f"logit_bias: token id {t} is out of the vocabulary (0..{vocab - 1})")
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not -100 <= v <= 100:
+                raise ApiError(400, f"logit_bias: the value of {k} must be a number in [-100, 100], got {v!r}")
+            if v:
+                parsed[t] = float(v)
+        if parsed:
+            out["logit_bias"] = parsed
+    m = body.get("min_tokens")
+    if m is not None:
+        if isinstance(m, bool) or not isinstance(m, int) or m < 0:
+            raise ApiError(400, "min_tokens: an integer >= 0 is required")
+        if m > max_new:
+            raise ApiError(400, f"min_tokens ({m}) is greater than max_tokens ({max_new})")
+        if m:
+            out["min_tokens"] = m
+    ie = body.get("ignore_eos")
+    if ie is not None:
+        if not isinstance(ie, bool):
+            raise ApiError(400, "ignore_eos: true or false is required")
+        if ie:
+            out["ignore_eos"] = True
+    return out
+
+
+def logprobs_of(body, chat):
+    """Top logprobs per token the request asks for (-1: none): chat's logprobs (bool) + top_logprobs, completions'
+    logprobs (the number of top entries). 0..20, as vLLM's default max_logprobs."""
+    lp, top = body.get("logprobs"), body.get("top_logprobs") if chat else None
+    if chat:
+        if lp is not None and not isinstance(lp, bool):
+            raise ApiError(400, "logprobs: true or false is required")
+        if top is not None and (isinstance(top, bool) or not isinstance(top, int)):
+            raise ApiError(400, "top_logprobs: an integer is required")
+        if top and not lp:
+            raise ApiError(400, "top_logprobs requires logprobs: true")
+        n = (top or 0) if lp else -1
+    else:
+        if lp is not None and (isinstance(lp, bool) or not isinstance(lp, int)):
+            raise ApiError(400, "logprobs: an integer is required")
+        n = -1 if lp is None else lp
+    given = top if chat else lp
+    if given is not None and not 0 <= given <= MAX_LOGPROBS:
+        raise ApiError(400, f"{'top_logprobs' if chat else 'logprobs'}: must be in [0, {MAX_LOGPROBS}], got {given}")
+    return n
+
+
+def responses_logprobs_of(body):
+    """Top logprobs per token for the Responses API (-1: none): on with include "message.output_text.logprobs",
+    top_logprobs 0..20 (vLLM ignores top_logprobs without the include, and so do we)."""
+    include, top = body.get("include") or [], body.get("top_logprobs")
+    if top is not None and (isinstance(top, bool) or not isinstance(top, int)):
+        raise ApiError(400, "top_logprobs: an integer is required")
+    if top is not None and not 0 <= top <= MAX_LOGPROBS:
+        raise ApiError(400, f"top_logprobs: must be in [0, {MAX_LOGPROBS}], got {top}")
+    return (top or 0) if "message.output_text.logprobs" in include else -1
+
+
+def chat_logprobs(tok, entries):
+    """OpenAI chat's logprobs.content entries."""
+    def item(i, lp):
+        text, b = tok.piece(i)
+        return {"token": text, "logprob": max(lp, -9999.0), "bytes": list(b)}
+    return [dict(item(i, lp), top_logprobs=[item(j, v) for j, v in top]) for _, i, lp, top in entries]
+
+
+def completion_logprobs(tok, entries, offset=0):
+    """OpenAI completions' logprobs object (text_offset: offset + where each token's text starts)."""
+    return {"tokens": [tok.piece(i)[0] for _, i, _, _ in entries],
+            "token_logprobs": [max(lp, -9999.0) for _, _, lp, _ in entries],
+            "top_logprobs": [{tok.piece(j)[0]: max(v, -9999.0) for j, v in top} for _, _, _, top in entries],
+            "text_offset": [offset + o for o, _, _, _ in entries]}
 
 
 def stops_of(value):
@@ -456,12 +967,18 @@ def stops_of(value):
     return [value] if isinstance(value, str) else [s for s in value if isinstance(s, str)]
 
 
+class HTTPServer(ThreadingHTTPServer):
+    # The default listen backlog of 5 refuses a burst of 6+ connections at once on Windows (llama-swap 502, issue #7).
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     srv: Server = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics"):
+        if self.command == "GET" and self.path.split("?")[0] in ("/health", "/metrics", "/ui/state"):
             return  # (polled by the healthcheck and the benchmarks)
         sys.stderr.write("[api] " + fmt % args + "\n")
 
@@ -505,10 +1022,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/health":
-            if self.srv.engine.ready.is_set():
+            if self.srv.engine.on_demand:  # (the service is up: a request loads the engine and waits for it)
+                refused = self.srv.engine.refused
+                self._json(200, {"status": self.srv.engine.on_demand, **({"refused": refused[1]} if refused else {})})
+            elif self.srv.engine.ready.is_set():
                 self._json(200, {"status": "ok"})
             else:
-                self._json(503, {"status": "loading"})
+                self._json(503, {"status": self.srv.engine.state()})
         elif path == "/metrics":
             body = "".join(f"{k} {v}\n" for k, v in sorted(self.srv.engine.metrics.items())).encode()
             self.send_response(200)
@@ -527,15 +1047,51 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, card)
         elif path == "/admin/concurrency":
             if not self.srv.engine.ready.is_set():
-                return self._error(503, "the engine is loading", "overloaded_error")
+                e = self.srv.engine.not_ready()
+                return self._error(e.code, str(e), e.kind)
             self._json(200, self.srv.engine.config)
+        elif path == "/admin/engine":
+            self._json(200, self.engine_settings())
         elif path == "/version":
             self._json(200, {"version": "q27-phase6"})
+        elif path == "/ui":
+            body = UI_PAGE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/ui/state":
+            self._json(200, dict(HUB.init(), tick=HUB.tick()))
+        elif path == "/ui/stream":
+            self.ui_stream()
         else:
             self._error(404, "not found", "not_found")
 
+    def ui_stream(self):
+        """Server-sent events of the stats UI: "init" (configuration, sample history, log), then "tick" (the
+        requests, VRAM, last GPU sample) every second and "log" (new entries) as they come."""
+        self._sse_start()
+        try:
+            init = dict(HUB.init(), tick=HUB.tick())
+            self._sse(init, "init")
+            seen = init["log"][-1]["n"] if init["log"] else 0
+            last = time.time()
+            while True:
+                HUB.wait(1.0)
+                new = HUB.log_since(seen)
+                if new:
+                    seen = new[-1]["n"]
+                    self._sse(new, "log")
+                if time.time() - last >= 1.0:
+                    last = time.time()
+                    self._sse(HUB.tick(), "tick")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def do_HEAD(self):
-        self.send_response(200 if self.srv.engine.ready.is_set() else 503)
+        self.send_response(200 if self.srv.engine.ready.is_set() or self.srv.engine.on_demand else 503)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -548,18 +1104,27 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as e:
             return self._error(400, f"bad JSON: {e}")
         path = self.path.split("?")[0].rstrip("/")
-        if DUMP_DIR:  # (debug: the requests as clients send them)
-            name = f"{time.strftime('%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
-            (pathlib.Path(DUMP_DIR) / name).write_text(json.dumps(body, ensure_ascii=False, indent=1))
+        if DUMP_DIR:  # (debug: the requests as clients send them; a failed write does not fail the request)
+            name = f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 10**9:09d}{path.replace('/', '_')}.json"
+            try:
+                d = pathlib.Path(DUMP_DIR)
+                d.mkdir(parents=True, exist_ok=True)
+                (d / name).write_text(json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+            except OSError as e:
+                log(f"API_DUMP_DIR: {e}")
         routes = {"/v1/chat/completions": self.chat, "/v1/completions": self.completions, "/v1/responses": self.responses_api,
                   "/v1/messages": self.messages, "/v1/messages/count_tokens": self.count_tokens,
-                  "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency}
+                  "/tokenize": self.tokenize, "/detokenize": self.detokenize, "/admin/concurrency": self.concurrency,
+                  "/admin/engine": self.engine_control, "/admin/engine/plan": self.engine_plan,
+                  "/admin/engine/idle": self.engine_idle}
         fn = routes.get(path)
         if fn is None:
             return self._error(404, "not found", "not_found")
+        HUB.local.meta = request_meta(path, self.headers, body) if path in GENERATE else None
         try:
             fn(body)
         except ApiError as e:
+            HUB.http_error(path, e.code, str(e))
             self._error(e.code, str(e), e.kind)
         except (AnthropicError, ValueError, KeyError, TypeError) as e:
             self._error(400, f"{type(e).__name__}: {e}" if not isinstance(e, (AnthropicError, ValueError)) else str(e))
@@ -578,25 +1143,28 @@ class Handler(BaseHTTPRequestHandler):
     def chat(self, body):
         if (body.get("n") or 1) != 1:
             raise ApiError(400, "n > 1 is not supported")
-        if body.get("logprobs") or body.get("top_logprobs"):
-            raise ApiError(400, "logprobs are not supported")
+        nlp = logprobs_of(body, chat=True)
         kwargs = template_kwargs(body, self.srv.thinking_default)
         thinking = kwargs.get("enable_thinking", True) is not False
         tools = body.get("tools") or None
-        parse_tools = tools is not None and body.get("tool_choice") != "none"
+        choice = tool_choice_of(body.get("tool_choice"), tools)
+        parse_tools = tools is not None and choice[0] != "none"
         messages = normalize_messages(body.get("messages"))
-        ids, images = self.srv.render(messages, tools, kwargs)
+        ids, images = self.srv.render(messages, tools, kwargs, body.get("mm_processor_kwargs"))
         left = self.srv.limit(len(ids))
         max_new = body.get("max_completion_tokens") or body.get("max_tokens") or left
         if max_new <= 0:
             raise ApiError(400, "max_tokens must be positive")
         stream = bool(body.get("stream"))
         keep = (lambda: self._keepalive_comment()) if stream else None
-        gen = Generation(self.srv, ids, min(max_new, left), sampling_of(body), stops_of(body.get("stop")), images,
-                         self.connection, keep)
-        parser = OutputParser(thinking, tools if parse_tools else None)
+        grammar = self.srv.constrain(lambda: structured.chat_format(body), choice, tools, thinking)
+        sampling = dict(sampling_of(body), logprobs=nlp, **token_controls_of(body, self.srv.vocab, min(max_new, left)))
+        gen = Generation(self.srv, ids, min(max_new, left), sampling,
+                         stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking),
+                         grammar, marked=True)
+        parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
-        single_call = body.get("parallel_tool_calls") is False
+        single_call = body.get("parallel_tool_calls") is False or choice[0] == "named"
         if stream:
             return self._chat_stream(gen, parser, rid, created, model, body, single_call)
         reasoning, content, calls = [], [], []
@@ -607,6 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
             (reasoning if kind == "reasoning" else content if kind == "content" else calls).append(v)
         if single_call:
             calls = calls[:1]
+        lps = {"content": chat_logprobs(self.srv.tok, gen.take_logprobs())} if nlp >= 0 else None
         msg = {"role": "assistant", "content": "".join(content) or (None if calls else "")}
         if thinking:
             msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
@@ -615,9 +1184,9 @@ class Handler(BaseHTTPRequestHandler):
             msg["tool_calls"] = [openai_call(c) for c in calls]
             finish = "tool_calls"
         self._json(200, {"id": rid, "object": "chat.completion", "created": created, "model": model,
-                         "choices": [{"index": 0, "message": msg, "finish_reason": finish, "logprobs": None,
+                         "choices": [{"index": 0, "message": msg, "finish_reason": finish, "logprobs": lps,
                                       "stop_reason": gen.stop_sequence}],
-                         "usage": gen.usage})
+                         "usage": gen.usage, **gen.timing_fields})
 
     def _keepalive_comment(self):
         self.wfile.write(b": keep-alive\n\n")
@@ -626,15 +1195,24 @@ class Handler(BaseHTTPRequestHandler):
     def _chat_stream(self, gen, parser, rid, created, model, body, single_call):
         self._sse_start()
 
-        def chunk(delta, finish=None):
+        want_lp = gen.sampling_logprobs >= 0
+        pending = []  # logprobs of the text out of the generation the chunks have not carried yet
+
+        def chunk(delta, finish=None, **extra):
+            lps = None
+            if want_lp:
+                pending.extend(gen.take_logprobs())
+                lps = {"content": chat_logprobs(self.srv.tok, pending)} if pending else None
+                pending.clear()
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": None}]})
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish, "logprobs": lps}], **extra})
 
         chunk({"role": "assistant", "content": ""})
         ncalls = 0
 
         def send(events):
             nonlocal ncalls
+            sent = False
             for kind, v in events:
                 if kind == "reasoning":
                     chunk({"reasoning_content": v, "reasoning": v})
@@ -643,6 +1221,13 @@ class Handler(BaseHTTPRequestHandler):
                 elif not (single_call and ncalls):
                     chunk({"tool_calls": [openai_call(v, ncalls)]})
                     ncalls += 1
+                else:
+                    continue
+                sent = True
+            if want_lp and not sent:  # (text the parser holds or drops: its tokens still go out, as vLLM sends them)
+                pending.extend(gen.take_logprobs())
+                if pending:
+                    chunk({})
 
         try:
             for piece in gen:
@@ -652,10 +1237,11 @@ class Handler(BaseHTTPRequestHandler):
             self._sse({"error": {"message": str(e), "type": e.kind, "code": e.code}})
             self.wfile.write(b"data: [DONE]\n\n")
             return
-        chunk({}, "tool_calls" if ncalls else gen.finish)
-        if (body.get("stream_options") or {}).get("include_usage"):
+        include_usage = (body.get("stream_options") or {}).get("include_usage")  # (timings go on the last chunk)
+        chunk({}, "tool_calls" if ncalls else gen.finish, **({} if include_usage else gen.timing_fields))
+        if include_usage:
             self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
-                       "choices": [], "usage": gen.usage})
+                       "choices": [], "usage": gen.usage, **gen.timing_fields})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -673,26 +1259,32 @@ class Handler(BaseHTTPRequestHandler):
         left = self.srv.limit(len(ids))
         max_new = min(body.get("max_tokens") or 16, left)
         stream = bool(body.get("stream"))
-        gen = Generation(self.srv, ids, max_new, sampling_of(body), stops_of(body.get("stop")), None,
-                         self.connection, (lambda: self._keepalive_comment()) if stream else None)
+        nlp = logprobs_of(body, chat=False)
+        grammar = self.srv.constrain(lambda: structured.chat_format(body), ("auto", None), None, False)
+        sampling = dict(sampling_of(body), logprobs=nlp, **token_controls_of(body, self.srv.vocab, max_new))
+        gen = Generation(self.srv, ids, max_new, sampling, stops_of(body.get("stop")),
+                         None, self.connection, (lambda: self._keepalive_comment()) if stream else None, None, grammar)
         rid, created, model = f"cmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
+        lps = (lambda: completion_logprobs(self.srv.tok, gen.take_logprobs())) if nlp >= 0 else (lambda: None)
         if stream:
             self._sse_start()
             for piece in gen:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                           "choices": [{"index": 0, "text": piece, "finish_reason": None, "logprobs": None}]})
+                           "choices": [{"index": 0, "text": piece, "finish_reason": None, "logprobs": lps()}]})
+            include_usage = (body.get("stream_options") or {}).get("include_usage")
             self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": None}]})
-            if (body.get("stream_options") or {}).get("include_usage"):
+                       "choices": [{"index": 0, "text": "", "finish_reason": gen.finish, "logprobs": lps()}],
+                       **({} if include_usage else gen.timing_fields)})
+            if include_usage:
                 self._sse({"id": rid, "object": "text_completion", "created": created, "model": model,
-                           "choices": [], "usage": gen.usage})
+                           "choices": [], "usage": gen.usage, **gen.timing_fields})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             return
         text = "".join(gen)
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": model,
-                         "choices": [{"index": 0, "text": text, "finish_reason": gen.finish, "logprobs": None}],
-                         "usage": gen.usage})
+                         "choices": [{"index": 0, "text": text, "finish_reason": gen.finish, "logprobs": lps()}],
+                         "usage": gen.usage, **gen.timing_fields})
 
     # ------------------------------------------------------------ Anthropic messages
 
@@ -712,13 +1304,16 @@ class Handler(BaseHTTPRequestHandler):
         ids, images, tools, thinking = self._anthropic_prompt(body)
         left = self.srv.limit(len(ids), anthropic=True)
         tc = body.get("tool_choice") or {}
-        parse_tools = bool(tools) and tc.get("type") != "none"
-        single_call = bool(tc.get("disable_parallel_tool_use"))
+        choice = tool_choice_of(body.get("tool_choice"), tools)
+        parse_tools = bool(tools) and choice[0] != "none"
+        single_call = bool(tc.get("disable_parallel_tool_use")) or choice[0] == "named"
         stream = bool(body.get("stream"))
         keep = (lambda: self._sse({"type": "ping"}, "ping")) if stream else None
+        grammar = self.srv.constrain(lambda: structured.anthropic_format(body), choice, tools, thinking)
         gen = Generation(self.srv, ids, min(body["max_tokens"], left), sampling_of(body),
-                         stops_of(body.get("stop_sequences")), images, self.connection, keep)
-        parser = OutputParser(thinking, tools if parse_tools else None)
+                         stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking),
+                         grammar, marked=True)
+        parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         mid, model = f"msg_{gen.rid[4:]}", self._model(body)
         omit = (body.get("thinking") or {}).get("display") == "omitted" if isinstance(body.get("thinking"), dict) else False
 
@@ -827,23 +1422,28 @@ class Handler(BaseHTTPRequestHandler):
         messages, tools, namespaces, custom = responses_messages(body)
         kwargs = responses_template_kwargs(body, self.srv.thinking_default)
         thinking = kwargs.get("enable_thinking", True) is not False
-        ids, images = self.srv.render(normalize_messages(messages), tools, kwargs)
+        ids, images = self.srv.render(normalize_messages(messages), tools, kwargs, body.get("mm_processor_kwargs"))
         left = self.srv.limit(len(ids))
         max_new = min(body.get("max_output_tokens") or left, left)
-        parse_tools = bool(tools) and body.get("tool_choice") != "none"
+        choice = tool_choice_of(body.get("tool_choice"), tools)
+        parse_tools = bool(tools) and choice[0] != "none"
         stream = bool(body.get("stream"))
-        gen = Generation(self.srv, ids, max_new, sampling_of(body), (), images, self.connection,
-                         (lambda: self._keepalive_comment()) if stream else None)
-        parser = OutputParser(thinking, tools if parse_tools else None)
+        grammar = self.srv.constrain(lambda: structured.responses_format(body), choice, tools, thinking)
+        nlp = responses_logprobs_of(body)
+        gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), (), images, self.connection,
+                         (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking),
+                         grammar, marked=True)
+        parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         resp = {"id": f"resp_{gen.rid[4:]}", "object": "response", "created_at": int(time.time()), "status": "in_progress",
                 "model": self._model(body), "output": [], "instructions": body.get("instructions"),
                 "parallel_tool_calls": body.get("parallel_tool_calls", True), "tool_choice": body.get("tool_choice", "auto"),
                 "tools": body.get("tools") or [], "temperature": body.get("temperature"), "top_p": body.get("top_p"),
                 "reasoning": body.get("reasoning"), "store": False, "text": body.get("text"),
-                "max_output_tokens": body.get("max_output_tokens"), "usage": None, "error": None,
+                "max_output_tokens": body.get("max_output_tokens"), "top_logprobs": body.get("top_logprobs") or 0, "usage": None, "error": None,
                 "incomplete_details": None, "metadata": body.get("metadata") or {}}
         out = ResponsesOut(self._sse if stream else None, "reasoning.encrypted_content" in (body.get("include") or []),
-                           namespaces, custom, body.get("parallel_tool_calls") is False)
+                           namespaces, custom, body.get("parallel_tool_calls") is False or choice[0] == "named",
+                           (lambda: chat_logprobs(self.srv.tok, gen.take_logprobs())) if nlp >= 0 else None)
         if stream:
             self._sse_start()
             out.ev("response.created", response=resp)
@@ -889,28 +1489,122 @@ class Handler(BaseHTTPRequestHandler):
         changes = {k: int(v) if k in ("target_seqs", "kv_reserve") else v for k, v in body.items()}
         self._json(200, self.srv.engine.configure(changes))
 
+    def engine_settings(self):
+        """GET /admin/engine: the state, the settings of the running engine and of the next start, the weights, and the
+        variables that would keep what changed since the server started."""
+        eng, launch = self.srv.engine, self.srv.launch
+        (device, source) = HUB.plan_device()
+        running = eng.cfg.get("settings") if eng.state() != "stopped" else None
+        keep = launch.env_changes()
+        if eng.idle_unload != eng.idle_unload_at_start:
+            keep["ENGINE_IDLE_UNLOAD_S"] = f"{eng.idle_unload:g}"
+        return {"state": eng.state(), "unloaded": eng.on_demand == "unloaded", "idle_unload_s": eng.idle_unload, "keep_env": keep,
+                "at_start": launch.at_start,
+                "refused": eng.refused[1] if eng.refused else None,
+                "running": running, "settings": launch.settings,
+                "weights": launch.weights_choices(), "device": {"free": device[0], "total": device[1], "source": source}
+                if device else None}
+
+    def engine_plan(self, body):
+        """{"settings": {...}} (changes to the next start's settings): their memory plan and, for each setting, the
+        plans of its other values."""
+        settings = body.get("settings") or {}
+        if not isinstance(settings, dict):
+            raise ApiError(400, "settings: an object")
+        device, source = HUB.plan_device()
+        if device is None:
+            raise ApiError(503, "the device's memory is unknown (no NVML and no engine started yet)", "overloaded_error")
+        self._json(200, self.srv.launch.plan_answer(settings, device, source))
+
+    def engine_idle(self, body):
+        """{"idle_unload_s": seconds} (0: off): applies at once, until the server restarts. Needs Content-Type:
+        application/json, like engine_control."""
+        if self.headers.get_content_type() != "application/json":
+            raise ApiError(415, "send the setting as JSON (Content-Type: application/json)")
+        v = body.get("idle_unload_s")
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v < float("inf"):
+            raise ApiError(400, "idle_unload_s: seconds, 0 or more (0: off)")
+        self.srv.engine.set_idle_unload(float(v))
+        HUB.add_log("admin", None, f"unload when idle: {f'after {v:g} s without a request' if v else 'off'}")
+        self._json(200, self.srv.engine.idle_state())
+
+    def engine_control(self, body):
+        """{"action": "start" | "stop" | "restart" | "save", "settings": {...}}: the engine process (stop frees its VRAM;
+        requests in flight fail with 503). Start and restart take changes to the start settings (launch.py), kept for
+        later starts; save only keeps them for the next load, while the engine is stopped or unloaded, without asking
+        whether they fit the VRAM free now (the load does). Needs Content-Type: application/json, so that a web page
+        cannot send it with a plain form."""
+        if self.headers.get_content_type() != "application/json":
+            raise ApiError(415, "send the action as JSON (Content-Type: application/json)")
+        action, settings = body.get("action"), body.get("settings")
+        if action not in ("start", "stop", "restart", "save"):
+            raise ApiError(400, "action: start, stop, restart or save")
+        if action == "save" and settings is None:
+            raise ApiError(400, "settings: what to save")
+        eng, launch = self.srv.engine, self.srv.launch
+        note = ""
+        if settings is not None:
+            if action == "stop" or not isinstance(settings, dict):
+                raise ApiError(400, "settings: an object, with start or restart")
+            if action in ("start", "save") and eng.state() != "stopped":
+                raise ApiError(409, "the engine is running: restart it to change its settings")
+            device, _ = HUB.plan_device()
+            s = launch.validate(settings, device=device, check_budget=action != "save")
+            if device is not None and action != "save":
+                plan = launch.plan_many([s], device)[0]
+                if "error" in plan or not plan["fits"]:
+                    raise ApiError(400, f"these settings do not fit: {plan.get('error') or 'the device pools exceed the budget'}")
+            try:
+                cfg = launch.config(s)
+            except FileNotFoundError as e:
+                raise ApiError(400, str(e)) from e
+            # (the admission settings of /admin/concurrency stay; the target number of requests with the same MAX_SEQS)
+            keep = ("admit_kv", "kv_reserve", "min_seq_tps") + (("target_seqs",) if s["max_seqs"] == eng.cfg["max_seqs"] else ())
+            self.srv.use_template_of(s["weights"])
+            launch.settings, eng.cfg = s, dict(cfg, **{k: eng.cfg[k] for k in keep if k in eng.cfg})
+            note = " with " + ", ".join(f"{k}={v}" for k, v in s.items())
+        if action == "save":
+            HUB.add_log("admin", None, f"settings for the next load:{note.removeprefix(' with')}")
+            return self._json(200, {"state": eng.state(), "settings": launch.settings})
+        HUB.add_log("admin", None, f"engine {action} requested{note}", level="warn" if action != "start" else "info")
+        self._json(200, {"state": eng.control(action), "settings": launch.settings})
+
     def tokenize(self, body):
         if "messages" in body:
             kwargs = template_kwargs(body, self.srv.thinking_default)
-            ids, _ = self.srv.render(normalize_messages(body["messages"]), body.get("tools"), kwargs)
+            ids, _ = self.srv.render(normalize_messages(body["messages"]), body.get("tools"), kwargs,
+                                     body.get("mm_processor_kwargs"))
         else:
             ids = self.srv.encode(body.get("prompt", ""))
         self._json(200, {"tokens": ids, "count": len(ids), "max_model_len": self.srv.max_tokens})
 
     def detokenize(self, body):
         with self.srv.tok_lock:
-            text = self.srv.tok.decode(body.get("tokens") or [], skip_special_tokens=False)
+            text = self.srv.tok.decode(body.get("tokens") or [])
         self._json(200, {"prompt": text})
 
 
 class ResponsesOut:
     """Output items of a Responses API answer from the parser's events, with the streaming events (sse: None
     for a non-streaming answer). Reasoning goes out as reasoning_text (and, when the client asks for
-    `reasoning.encrypted_content`, also in it, so that it comes back with the next request)."""
+    `reasoning.encrypted_content`, also in it, so that it comes back with the next request).
 
-    def __init__(self, sse, encrypted, namespaces, custom, single_call):
+    take_lps (None: no logprobs) gives the logprobs entries of the generation's text out since the last call. The
+    tokens out since the last events go with the events' first message text when they have some, else (reasoning, a
+    tool call, held text) they are dropped: output_text.logprobs has the tokens of the message's text (and of markup
+    out in the same piece, like </think> before it), not those of the reasoning or the tool calls."""
+
+    def __init__(self, sse, encrypted, namespaces, custom, single_call, take_lps=None):
         self.sse, self.encrypted, self.namespaces, self.custom, self.single = sse, encrypted, namespaces, custom, single_call
         self.items, self.cur, self.seq, self.ncalls = [], None, 0, 0
+        self.take_lps, self.pending = take_lps, []
+
+    @staticmethod
+    def _stream_lps(entries):
+        """The streaming events' form (no bytes, as vLLM and OpenAI send them)."""
+        return [{"token": e["token"], "logprob": e["logprob"],
+                 "top_logprobs": [{"token": t["token"], "logprob": t["logprob"]} for t in e["top_logprobs"]]}
+                for e in entries]
 
     def ev(self, kind, **kw):
         if self.sse:
@@ -930,21 +1624,26 @@ class ResponsesOut:
         it, idx = self.cur, len(self.items) - 1
         if it is None:
             return
-        text = it.pop("_text")
+        text, lps = it.pop("_text"), it.pop("_lps", [])
         if it["type"] == "reasoning":
             it["content"] = [{"type": "reasoning_text", "text": text}]
             if self.encrypted:
                 it["encrypted_content"] = thinking_signature(text)
             self.ev("response.reasoning_text.done", item_id=it["id"], output_index=idx, content_index=0, text=text)
         else:
-            part = {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
-            self.ev("response.output_text.done", item_id=it["id"], output_index=idx, content_index=0, text=text, logprobs=[])
+            part = {"type": "output_text", "text": text, "annotations": [], "logprobs": lps}
+            self.ev("response.output_text.done", item_id=it["id"], output_index=idx, content_index=0, text=text,
+                    logprobs=self._stream_lps(lps))
             self.ev("response.content_part.done", item_id=it["id"], output_index=idx, content_index=0, part=part)
             it["content"], it["status"] = [part], "completed"
         self.ev("response.output_item.done", output_index=idx, item=it)
         self.cur = None
 
     def feed(self, events):
+        if self.take_lps:
+            self.pending.extend(self.take_lps())
+            if not any(kind == "content" for kind, _ in events):
+                self.pending = []
         for kind, v in events:
             if kind == "reasoning":
                 if self.cur is None or self.cur["type"] != "reasoning":
@@ -959,8 +1658,10 @@ class ResponsesOut:
                     self.ev("response.content_part.added", item_id=self.cur["id"], output_index=len(self.items) - 1,
                             content_index=0, part={"type": "output_text", "text": "", "annotations": [], "logprobs": []})
                 self.cur["_text"] += v
+                lps, self.pending = self.pending, []
+                self.cur.setdefault("_lps", []).extend(lps)
                 self.ev("response.output_text.delta", item_id=self.cur["id"], output_index=len(self.items) - 1,
-                        content_index=0, delta=v, logprobs=[])
+                        content_index=0, delta=v, logprobs=self._stream_lps(lps))
             elif not (self.single and self.ncalls):
                 self.close()
                 self.ncalls += 1
@@ -997,12 +1698,12 @@ START_TIME = time.time()
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     env = os.environ.get
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--host", default=env("HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(env("PORT", 8000)))
     ap.add_argument("--max-tokens", type=int, default=int(env("MAX_TOKENS", 262144)))
     ap.add_argument("--prefill-chunk", type=int, default=int(env("PREFILL_CHUNK", 2048)))
     ap.add_argument("--kv-dtype", default=env("KV_DTYPE", "nvfp4"), choices=["bf16", "fp8", "nvfp4"])
-    ap.add_argument("--spec", default=env("SPEC", "dflash2"), choices=["dflash2", "none"])
+    ap.add_argument("--spec", default=default_spec(), choices=["dspine", "dflash2", "none"])
     ap.add_argument("--weights", default=env("WEIGHTS", "gdnfp4"),
                     help="gdnfp4: GDN projections in NVFP4, attention FP8 (Phase Q, scripts/build-gdnfp4.sh); nvidia: "
                          "FP8 GDN / attention projections; quasar: every linear in NVFP4; or a model directory")
@@ -1020,38 +1721,36 @@ def main():
                     help="decode turn of a request when several decode")
     ap.add_argument("--batch-decode", type=int, default=int(env("BATCH_DECODE", 1)),
                     help="1: requests in decode step together (batched speculative steps); 0: they take turns")
+    ap.add_argument("--idle-unload", type=float, default=float(env("ENGINE_IDLE_UNLOAD_S", 0)),
+                    help="stop the engine after this many seconds without a request, freeing its VRAM; the next "
+                         "request loads it again (0: off, the engine stays ready)")
     args = ap.parse_args()
 
-    from transformers import AutoTokenizer
+    from tokenizer import Tokenizer, fingerprint
 
-    from qwen27b.weights import DFLASH2, engine_target, snapshot
-
-    path = engine_target(args.weights)  # (quasar: sets Q27_LM_HEAD_CKPT, its lm_head is the BF16 original)
-    tok = AutoTokenizer.from_pretrained(path)
-    eos = json.loads((path / "generation_config.json").read_text())["eos_token_id"]
-    draft = snapshot(*DFLASH2) if args.spec == "dflash2" else None
+    path = model_dir(args.weights)  # (the tokenizer: other weights must have the same, Launch.weights_choices)
+    tok = Tokenizer(path)
+    set_engine_env(ROOT)
+    base = {"prefill_chunk": args.prefill_chunk, "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv),
+            "kv_reserve": args.kv_reserve, "decode_share": args.decode_share, "quantum_ms": args.quantum_ms,
+            "batch_decode": bool(args.batch_decode), "im_start": tok.token_id("<|im_start|>"),
+            "user": tok.encode("user")[0], "breaks": tok.paragraph_breaks(),
+            "engine_python": str(ROOT / "engine/python"), "tokenizer": str(pathlib.Path(path) / "tokenizer.json")}
     # Images by default with the vision tower in pinned host memory (no KV pool cost); the library default is off.
-    os.environ.setdefault("VISION", "host")
-    os.environ["MAX_SEQS"] = str(max(1, args.max_seqs))  # (the engine's parking areas)
-    # MAX_TOKENS is an upper bound: the engine lowers it to what the VRAM budget fits (e.g. with MAX_SEQS=8).
-    os.environ.setdefault("MAX_TOKENS_FIT", "1")
-    if draft and "Q27_DRAFT_VOCAB" not in os.environ:
-        vocab = ROOT / "bench/draft-vocab/vocab-128k.txt"
-        if vocab.exists():
-            os.environ["Q27_DRAFT_VOCAB"] = str(vocab)
-    cfg = {"model": str(path), "draft": str(draft) if draft else None, "max_tokens": args.max_tokens,
-           "prefill_chunk": args.prefill_chunk, "kv_dtype": args.kv_dtype, "max_seqs": max(1, args.max_seqs),
-           "min_seq_tps": args.min_seq_tps, "admit_kv": bool(args.admit_kv), "kv_reserve": args.kv_reserve,
-           "decode_share": args.decode_share, "quantum_ms": args.quantum_ms, "batch_decode": bool(args.batch_decode),
-           "eos": eos if isinstance(eos, list) else [eos], "im_start": tok.convert_tokens_to_ids("<|im_start|>"),
-           "engine_python": str(ROOT / "engine/python")}
-    engine = EngineClient(cfg)
-    images = None
-    if os.environ.get("VISION", "off") != "off":  # (the image processor also needs IMAGE_MAX_PIXELS)
-        images = Images(path, int(os.environ.get("IMAGE_MAX_PIXELS", 4194304)))
-    Handler.srv = Server(engine, tok, args.max_tokens, images)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
+    launch = Launch(base, dict(env_settings(), weights=args.weights, kv_dtype=args.kv_dtype, spec=args.spec,
+                               max_seqs=max(1, min(args.max_seqs, 8)), max_tokens=args.max_tokens),
+                    tokenizer=fingerprint(path))
+    HUB.start()
+    if not os.environ.get("SPEC") and args.spec == "dflash2":  # (default_spec: DSpine is not downloaded)
+        note = ("the DSpine draft (the default) is not downloaded, so the DFlash2 draft is used: "
+                "scripts/download-weights.sh gets DSpine (4.1 GB), or set SPEC=dflash2 to keep DFlash2")
+        log(note)
+        HUB.add_log("admin", None, note, level="warn")
+    engine = EngineClient(launch.config(launch.settings), autostart=env("ENGINE_AUTOSTART", "1") != "0",
+                          idle_unload=max(0.0, args.idle_unload))
+    HUB.engine_idle = engine.idle_state
+    Handler.srv = Server(engine, tok, args.max_tokens, launch)
+    server = HTTPServer((args.host, args.port), Handler)
 
     def stop(*_):
         log("stopping")
@@ -1060,7 +1759,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine is loading)")
+    log(f"serving {MODEL_NAME} on {args.host}:{args.port} (the engine {'is loading' if engine.wanted else 'is not loaded'})")
     server.serve_forever()
     engine.stop()
 

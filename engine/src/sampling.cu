@@ -187,61 +187,51 @@ __device__ void merge_lists(const Pick* base, int nseg, int k, float* sv, int* s
   __syncwarp();
 }
 
-__global__ void __launch_bounds__(32) merge_sample_kernel(const Pick* cand, int nseg, int k, float temperature,
-                                                          float top_p, const float* uniform, int32_t* out) {
-  pdl_trigger();
-  pdl_wait();
-  const int row = blockIdx.x, lane = threadIdx.x;
-  __shared__ float sv[kMaxK];
-  __shared__ int si[kMaxK];
-  merge_lists(cand + int64_t(row) * nseg * k, nseg, k, sv, si);
-  if (lane != 0) return;
-  if (k == 1) {
-    out[row] = si[0];
-    return;
+// Penalties (Penalty) on a sorted list v / id of L <= 64 entries in shared memory (warp-wide), sorted
+// again (value desc, then the old order). extra[0..nextra): more tokens to count (a verify row's path).
+__device__ void penalize_list(float* v, int* id, int L, const Penalty& pen, const int32_t* extra, int nextra) {
+  const int lane = threadIdx.x % 32;
+  float nv[2];
+  int ni[2], rank[2];
+  for (int e = 0; e < 2; e++) {
+    const int i = lane + 32 * e;
+    if (i >= L) continue;
+    ni[e] = id[i];
+    uint32_t c = pen.counts[ni[e]];
+    for (int j = 0; j < nextra; j++) c += extra[j] == ni[e];
+    nv[e] = c ? v[i] - pen.presence - pen.frequency * float(c) : v[i];
   }
-  // softmax(logits / T) over the top k, then the smallest prefix whose mass reaches top_p.
-  float p[kMaxK], total = 0.f;
-  for (int i = 0; i < k; i++) total += p[i] = expf((sv[i] - sv[0]) / temperature);
-  int n = k;
-  float cum = 0.f;
-  for (int i = 0; i < k; i++) {
-    cum += p[i] / total;
-    if (cum >= top_p) {
-      n = i + 1;
-      break;
-    }
+  __syncwarp();
+  for (int e = 0; e < 2; e++)
+    if (lane + 32 * e < L) v[lane + 32 * e] = nv[e];
+  __syncwarp();
+  for (int e = 0; e < 2; e++) {
+    const int i = lane + 32 * e;
+    if (i >= L) continue;
+    int r = 0;
+    for (int j = 0; j < L; j++) r += v[j] > nv[e] || (v[j] == nv[e] && j < i);
+    rank[e] = r;
   }
-  float mass = 0.f;
-  for (int i = 0; i < n; i++) mass += p[i];
-  float u = uniform[row] * mass, c = 0.f;
-  int pick = si[n - 1];
-  for (int i = 0; i < n; i++) {
-    c += p[i];
-    if (u < c) {
-      pick = si[i];
-      break;
-    }
-  }
-  out[row] = pick;
+  __syncwarp();
+  for (int e = 0; e < 2; e++)
+    if (lane + 32 * e < L) v[rank[e]] = nv[e], id[rank[e]] = ni[e];
+  __syncwarp();
 }
 
-__global__ void __launch_bounds__(32) merge_lists_kernel(const Pick* cand, int nseg, int k, float* vals,
-                                                         int32_t* ids, const int32_t* idmap) {
-  pdl_trigger();
-  pdl_wait();
-  const int row = blockIdx.x, lane = threadIdx.x;
-  __shared__ float sv[kMaxK];
-  __shared__ int si[kMaxK];
-  merge_lists(cand + int64_t(row) * nseg * k, nseg, k, sv, si);
-  for (int i = lane; i < k; i += 32) vals[row * k + i] = sv[i], ids[row * k + i] = idmap ? idmap[si[i]] : si[i];
-}
-
-// The sampler's distribution over a sorted top-k list (merge_sample_kernel): p[i] (unnormalized,
-// i < n after the top-p cut) and their mass.
-__device__ int target_dist(const float* v, int k, float temperature, float top_p, float* p, float& mass) {
+// The sampler's distribution over a sorted top-k list: p[i] (unnormalized, i < n after the min_p and
+// top-p cuts) and their mass. min_p keeps p >= min_p * p_max, then top-p the smallest prefix whose
+// share of what is left reaches top_p.
+__device__ int target_dist(const float* v, int k, float temperature, float top_p, float min_p, float* p, float& mass) {
   float total = 0.f;
   for (int i = 0; i < k; i++) total += p[i] = expf((v[i] - v[0]) / temperature);
+  if (min_p > 0.f) {  // (p[0] = 1)
+    int m = 1;
+    while (m < k && p[m] >= min_p) m++;
+    if (m < k) {
+      k = m, total = 0.f;
+      for (int i = 0; i < k; i++) total += p[i];
+    }
+  }
   int n = k;
   float cum = 0.f;
   for (int i = 0; i < k; i++) {
@@ -266,6 +256,40 @@ __device__ int pick(const float* p, int n, float mass, float u, const int32_t* i
   return id[n - 1];
 }
 
+// L: the merged list's length (k, or 64 with penalties); k: the sampler's top-k.
+__global__ void __launch_bounds__(32) merge_sample_kernel(const Pick* cand, int nseg, int L, int k, float temperature,
+                                                          float top_p, float min_p, Penalty pen, const float* uniform,
+                                                          int32_t* out, LogprobSink lp) {
+  pdl_trigger();
+  pdl_wait();
+  const int row = blockIdx.x, lane = threadIdx.x;
+  __shared__ float sv[kMaxK];
+  __shared__ int si[kMaxK];
+  merge_lists(cand + int64_t(row) * nseg * L, nseg, L, sv, si);
+  if (lane < lp.n) lp.tv[lane] = sv[lane], lp.ti[lane] = si[lane];  // (the raw list, before the penalties)
+  if (pen.counts) penalize_list(sv, si, L, pen, nullptr, 0);
+  if (lane != 0) return;
+  int tok = si[0];
+  if (k > 1) {
+    float p[kMaxK], mass;
+    const int n = target_dist(sv, k, temperature, top_p, min_p, p, mass);
+    tok = pick(p, n, mass, uniform[row], si);
+  }
+  out[row] = tok;
+  if (pen.counts) atomicAdd(pen.counts + tok, 1u);
+}
+
+__global__ void __launch_bounds__(32) merge_lists_kernel(const Pick* cand, int nseg, int k, float* vals,
+                                                         int32_t* ids, const int32_t* idmap) {
+  pdl_trigger();
+  pdl_wait();
+  const int row = blockIdx.x, lane = threadIdx.x;
+  __shared__ float sv[kMaxK];
+  __shared__ int si[kMaxK];
+  merge_lists(cand + int64_t(row) * nseg * k, nseg, k, sv, si);
+  for (int i = lane; i < k; i += 32) vals[row * k + i] = sv[i], ids[row * k + i] = idmap ? idmap[si[i]] : si[i];
+}
+
 // Down the draft tree (single thread; k <= 64). Greedy: follow the child whose token is the target's
 // argmax. Sampling: at node n the target distribution p (the sampler's, over the row's top-k list) is
 // tested against n's draws in draw order; a draw x is accepted with probability min(1, p(x) / q(x)),
@@ -284,7 +308,7 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
   // An accepted end-of-sequence token ends the step like a bonus token: the sequence then holds exactly
   // the tokens before it (a prefix cache checkpoint at the end of the generation matches the next turn).
   // So does reaching the token budget (the caller's max_tokens): the sequence never holds tokens past it.
-  auto stop = [&](int t) { return t == smp.stop[0] || t == smp.stop[1]; };
+  auto stop = [&](int t) { return t == smp.stop[0] || t == smp.stop[1] || t == smp.stop[2]; };
   const int limit = budget ? max(1, *budget) : kSpecBlock;  // tokens this step may output
   if (smp.temperature <= 0.f) {
     for (;;) {
@@ -304,7 +328,7 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
       const float* v = tv + n * ld;
       const int32_t* id = ti + n * ld;
       float mass;
-      const int m = target_dist(v, k, smp.temperature, smp.top_p, p, mass);
+      const int m = target_dist(v, k, smp.temperature, smp.top_p, smp.min_p, p, mass);
       for (int i = 0; i < m; i++) p[i] /= mass;
       mass = 1.f;
       const int d = tr->depth[n];
@@ -328,7 +352,7 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
           tot += p[i];
         }
         if (!(tot > 0.f)) {  // numerically empty residual: fall back to p
-          target_dist(v, k, smp.temperature, smp.top_p, p, tot);
+          target_dist(v, k, smp.temperature, smp.top_p, smp.min_p, p, tot);
         }
         mass = tot;
       }
@@ -347,6 +371,8 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
   for (int i = 1; i <= a; i++) out->tok[i - 1] = tr->tok[acc[i]];
   out->tok[a] = bonus;
   out->src = *ch.src;
+  if (smp.pen.counts)
+    for (int i = 0; i <= a; i++) atomicAdd(smp.pen.counts + out->tok[i], 1u);
   const int L = *pos;
   for (int i = 0; i <= a; i++) {
     cpath[i] = acc[i];
@@ -358,44 +384,60 @@ __device__ __forceinline__ void spec_accept_body(int32_t* ids, int32_t* block_id
 }
 
 __global__ void spec_accept_kernel(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k,
-                                   DraftChoice ch, SpecSampling smp, const uint64_t* rng, int32_t* ncommit,
+                                   int ld, DraftChoice ch, SpecSampling smp, const uint64_t* rng, int32_t* ncommit,
                                    int32_t* cpath, SpecOut* out, int32_t* hist, const int32_t* pos,
                                    const int32_t* par, const int32_t* budget) {
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
-  spec_accept_body(ids, block_ids, tv, ti, k, k, ch, smp, rng, ncommit, cpath, out, hist, pos, par, budget);
+  spec_accept_body(ids, block_ids, tv, ti, k, ld, ch, smp, rng, ncommit, cpath, out, hist, pos, par, budget);
 }
 
-// Batched steps (P6-10): block z accepts lane z (its rows 8 z .., top-k lists of ld entries, of which the
-// lane's sampling uses k[z]; candidates at cand + (8 z + 1) * 16; scalars at z offsets; SpecOut [n][2]).
-__global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int ld,
+// Batched steps (P6-10): block z accepts lane z (its rows al.lr.first(z) .., top-k lists of ld entries, of which
+// the lane's sampling uses k[z]; candidates on the rows after its first; scalars at z offsets; its anchor at
+// anchor + z, its commit path at cpath + kLaneSlot * z; SpecOut [n][2]).
+__global__ void spec_accept_lanes_kernel(int32_t* ids, int32_t* anchor, const float* tv, const int32_t* ti, int ld,
                                          AcceptLanes al, const int32_t* cand, SpecTree* trees, const int32_t* src,
                                          const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
                                          const int32_t* pos, const int32_t* par, const int32_t* budget) {
   pdl_trigger();
   pdl_wait();
   if (threadIdx.x != 0) return;
-  const int z = blockIdx.x, r0 = kSpecBlock * z;
+  const int z = blockIdx.x, r0 = al.lr.first(z);
   DraftChoice ch;
   ch.cand = const_cast<int32_t*>(cand) + (r0 + 1) * kSpecSelK;
   ch.tree = trees + z;
   ch.src = const_cast<int32_t*>(src) + z;
-  spec_accept_body(ids + r0, block_ids + r0, tv + r0 * ld, ti + r0 * ld, lane_sel(al.k, z), ld, ch,
-                   lane_sel(al.smp, z), rng + 2 * z, ncommit + z, cpath + r0, out + 2 * z, nullptr, pos + z, par + z,
+  spec_accept_body(ids + r0, anchor + z, tv + r0 * ld, ti + r0 * ld, lane_sel(al.k, z), ld, ch, lane_sel(al.smp, z),
+                   rng + 2 * z, ncommit + z, cpath + kLaneSlot * z, out + 2 * z, nullptr, pos + z, par + z,
                    budget + z);
 }
 
-__global__ void spec_advance_lanes_kernel(int n, int32_t* pos, const int32_t* ncommit, int32_t* par, uint64_t* rng,
-                                          int32_t* budget) {
+__global__ void spec_advance_lanes_kernel(LaneRows lr, int32_t* pos, const int32_t* ncommit, int32_t* par,
+                                          uint64_t* rng, int32_t* budget, int32_t* prow0) {
   pdl_trigger();
   pdl_wait();
   const int z = threadIdx.x;
-  if (z >= n) return;
+  if (z >= lr.n) return;
   pos[z] += ncommit[z];
   budget[z] -= ncommit[z];
   par[z] ^= 1;
   rng[2 * z + 1] += 1;
+  prow0[z] = lr.first(z);
+}
+
+// The lanes' block ids (the anchor, then the mask id) and their verify rows' first id (the anchor) at the start of a
+// batched step.
+__global__ void lane_blocks_kernel(LaneRows lr, const int32_t* anchor, int mask_id, int32_t* block_ids,
+                                   int32_t* ids) {
+  pdl_trigger();
+  pdl_wait();
+  const int t = threadIdx.x;
+  if (t >= lr.total()) return;
+  const int z = lr.lane(t);
+  const bool first = t == lr.first(z);
+  block_ids[t] = first ? anchor[z] : mask_id;
+  if (first) ids[t] = anchor[z];
 }
 
 // Every position j <= pos - 2 whose token is the anchor: the match length m (tokens ending at j equal
@@ -431,6 +473,117 @@ __global__ void spec_advance_kernel(int32_t* pos, const int32_t* ncommit, int32_
   rng[1] += 1;
 }
 
+// Block (r, z): row r of lane z (node r of trees[z]).
+__global__ void __launch_bounds__(32) penalize_rows_kernel(float* tv, int32_t* ti, int ld, LaneRows lr, PenaltyLanes pl,
+                                                           const SpecTree* trees, float* raw_v, int32_t* raw_i) {
+  pdl_trigger();
+  pdl_wait();
+  const int r = blockIdx.x, z = blockIdx.y, lane = threadIdx.x;
+  const Penalty& pen = pl.pen[z];
+  const SpecTree& tr = trees[z];
+  if (r >= tr.n || r >= lr.rows(z)) return;
+  const int64_t row = lr.first(z) + r;
+  float* v = tv + row * ld;
+  int32_t* id = ti + row * ld;
+  if (raw_v && lane < kMaxTopLogprobs) {
+    const int64_t o = row * kMaxTopLogprobs + lane;
+    raw_v[o] = v[lane], raw_i[o] = id[lane];
+  }
+  if (!pen.counts) return;
+  __shared__ float sv[kMaxK];
+  __shared__ int si[kMaxK];
+  __shared__ int32_t path[kSpecBlock];
+  for (int i = lane; i < kMaxK; i += 32) sv[i] = v[i], si[i] = id[i];
+  const int d = tr.depth[r];
+  if (lane < d) path[lane] = tr.tok[tr.path[r][lane + 1]];
+  __syncwarp();
+  penalize_list(sv, si, kMaxK, pen, path, d);
+  for (int i = lane; i < kMaxK; i += 32) v[i] = sv[i], id[i] = si[i];
+}
+
+__global__ void count_tokens_kernel(uint32_t* counts, const int32_t* ids, int n, int delta) {
+  pdl_trigger();
+  pdl_wait();
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+    atomicAdd(counts + ids[i], uint32_t(delta));
+}
+
+__global__ void count_out_kernel(uint32_t* counts, const SpecOut* so, int delta) {
+  pdl_trigger();
+  pdl_wait();
+  if (int(threadIdx.x) < so->n) atomicAdd(counts + so->tok[threadIdx.x], uint32_t(delta));
+}
+
+__global__ void mask_logits_kernel(float* logits, int V, const uint32_t* mask, int words, LaneRows lr, uint32_t lanes) {
+  pdl_trigger();
+  pdl_wait();
+  const int row = blockIdx.y;
+  if (!(lanes >> lr.lane(row) & 1u)) return;
+  const uint32_t* m = mask + int64_t(row) * words;
+  float* x = logits + int64_t(row) * V;
+  for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < V; t += gridDim.x * blockDim.x)
+    if (!(m[t >> 5] >> (t & 31) & 1u)) x[t] = -INFINITY;
+}
+
+__global__ void bias_logits_kernel(float* logits, int V, BiasLanes bl, LaneRows lr) {
+  pdl_trigger();
+  pdl_wait();
+  const int z = lr.lane(blockIdx.x);
+  const BiasList* b = bl.list[z];
+  if (!b) return;
+  float* x = logits + int64_t(blockIdx.x) * V;
+  for (int i = threadIdx.x; i < b->n; i += blockDim.x) x[b->ids[i]] += b->vals[i];
+  if (b->eos_before > 0 && threadIdx.x < 2 && b->eos[threadIdx.x] >= 0) {
+    const int at = *bl.pos[z] + (bl.depth[z] ? bl.depth[z][blockIdx.x - lr.first(z)] + 1 : 0);
+    if (at < b->eos_before) x[b->eos[threadIdx.x]] = -INFINITY;
+  }
+}
+
+// Block-wide: the logprobs of token tok in row x (V logits) and the row's top n (tv / ti: its raw sorted list) into
+// entry i of out. One pass of an online log-sum-exp.
+__device__ void logprob_row(const float* x, int V, int tok, const float* tv, const int32_t* ti, int n, Logprobs* out,
+                            int i) {
+  float m = -INFINITY, s = 0.f;
+  for (int j = threadIdx.x; j < V; j += blockDim.x) {
+    const float v = x[j];
+    if (v > m) s = s * expf(m - v) + 1.f, m = v;
+    else if (v != -INFINITY) s += expf(v - m);  // (masked tokens: -inf - -inf would be NaN)
+  }
+  const float mx = block_best(Pick{m, int(threadIdx.x)}).v;
+  const float lse = mx + logf(block_sum(m == -INFINITY ? 0.f : s * expf(m - mx)));
+  if (threadIdx.x == 0) out->lp[i] = x[tok] - lse;
+  if (int(threadIdx.x) < n) out->top_id[i][threadIdx.x] = ti[threadIdx.x], out->top_lp[i][threadIdx.x] = tv[threadIdx.x] - lse;
+}
+
+// sample() with logprobs: the token of row 0 (*tok) and the raw list merge_sample_kernel kept.
+__global__ void __launch_bounds__(kThreads) sample_logprobs_kernel(const float* logits, int V, const int32_t* tok,
+                                                                   LogprobSink lp) {
+  pdl_trigger();
+  pdl_wait();
+  if (threadIdx.x == 0) lp.out->n = 1, lp.out->top = lp.n;
+  logprob_row(logits, V, *tok, lp.tv, lp.ti, lp.n, lp.out, 0);
+}
+
+// Block (i, z): output token i of lane z (see spec_logprobs).
+__global__ void __launch_bounds__(kThreads) spec_logprobs_kernel(const float* logits, int V, const float* tv,
+                                                                 const int32_t* ti, int ld, LaneRows lr, LogprobLanes ln,
+                                                                 const SpecTree* trees, const int32_t* cpath,
+                                                                 const int32_t* ncommit, const int32_t* ids,
+                                                                 Logprobs* out, const int32_t* par) {
+  pdl_trigger();
+  pdl_wait();
+  const int i = blockIdx.x, z = blockIdx.y, n = lane_sel(ln.n, z);
+  if (n < 0) return;
+  const int nc = ncommit[z];
+  Logprobs* o = out + 2 * z + par[z];
+  if (i == 0 && threadIdx.x == 0) o->n = nc, o->top = n;
+  if (i >= nc) return;
+  const int32_t* cp = cpath + kLaneSlot * z;  // (a single sequence: z = 0)
+  const int64_t row = lr.first(z) + cp[i];
+  const int tok = i + 1 < nc ? trees[z].tok[cp[i + 1]] : ids[lr.first(z)];
+  logprob_row(logits + row * V, V, tok, tv + row * ld, ti + row * ld, n, o, i);
+}
+
 Pick* g_cand = nullptr;  // candidate lists, kSampleMaxRows rows (allocated on the first, eager call)
 constexpr int kSampleMaxRows = std::max(kTreeMax, kMaxBatchRows);  // (a tree, or a batched step)
 
@@ -444,16 +597,39 @@ void logsoftmax_topk(const float* logits, int T, int V, int k, int32_t* ids, flo
 }
 
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-            int32_t* out, cudaStream_t s) {
+            int32_t* out, cudaStream_t s, float min_p, Penalty pen, LogprobSink lp) {
   if (top_k <= 0 || top_k > kMaxK) top_k = kMaxK;  // candidates are capped at 64
   if (T == 0) return;
+  Q27_CHECK(lp.n < 0 || (T == 1 && lp.n <= kMaxTopLogprobs && lp.tv && lp.ti && lp.out), "sample: logprobs out of range");
   const int k = temperature <= 0.f ? 1 : top_k;
+  // (penalties pick the top k from the 64 highest logits; the longer list's first k are the same)
+  const int L = pen.counts ? kMaxK : std::max(k, lp.n);
   const int nseg = int(ceil_div(V, kSeg));
   Q27_CHECK(nseg <= 32 * kMaxLists && T <= kSampleMaxRows, "sample: vocabulary or rows out of range");
   if (!g_cand) Q27_CUDA(cudaMalloc(&g_cand, sizeof(Pick) * kSampleMaxRows * 32 * kMaxLists * kMaxK));
-  launch_pdl(topk_segments_kernel, dim3(nseg, T), dim3(32), 0, s, logits, V, k, g_cand);
-  launch_pdl(merge_sample_kernel, dim3(T), dim3(32), 0, s, static_cast<const Pick*>(g_cand), nseg, k, temperature,
-             top_p, uniform, out);
+  launch_pdl(topk_segments_kernel, dim3(nseg, T), dim3(32), 0, s, logits, V, L, g_cand);
+  launch_pdl(merge_sample_kernel, dim3(T), dim3(32), 0, s, static_cast<const Pick*>(g_cand), nseg, L, k, temperature,
+             top_p, min_p, pen, uniform, out, lp);
+  if (lp.n >= 0) launch_pdl(sample_logprobs_kernel, dim3(1), dim3(kThreads), 0, s, logits, V, out, lp);
+}
+
+void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s) {
+  if (n <= 0) return;
+  launch_pdl(count_tokens_kernel, dim3(std::min(int(ceil_div(n, 256)), 64)), dim3(256), 0, s, counts, ids, n, delta);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void mask_logits(float* logits, int V, const uint32_t* mask, int words, const LaneRows& lr, uint32_t lanes,
+                 cudaStream_t s) {
+  Q27_CHECK(words * 32 >= V, "mask_logits: mask rows shorter than the vocabulary");
+  launch_pdl(mask_logits_kernel, dim3(64, lr.total()), dim3(256), 0, s, logits, V, mask, words, lr, lanes);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void bias_logits(float* logits, int V, const BiasLanes& bl, const LaneRows& lr, cudaStream_t s) {
+  Q27_CHECK(lr.n >= 1 && lr.n <= kMaxLanes, "bias_logits: 1..8 lanes");
+  launch_pdl(bias_logits_kernel, dim3(lr.total()), dim3(256), 0, s, logits, V, bl, lr);
+  Q27_CUDA(cudaGetLastError());
 }
 
 void topk_rows(const float* logits, int T, int V, int k, float* vals, int32_t* ids, cudaStream_t s,
@@ -467,11 +643,36 @@ void topk_rows(const float* logits, int T, int V, int k, float* vals, int32_t* i
   Q27_CUDA(cudaGetLastError());
 }
 
-void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k, DraftChoice choice,
-                 SpecSampling smp, const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out,
-                 int32_t* hist, const int32_t* pos, cudaStream_t s, const int32_t* par, const int32_t* budget) {
-  launch_pdl(spec_accept_kernel, dim3(1), dim3(32), 0, s, ids, block_ids, tv, ti, k, choice, smp, rng, ncommit, cpath,
-             out, hist, pos, par, budget);
+void spec_accept(int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int k, int ld,
+                 DraftChoice choice, SpecSampling smp, const uint64_t* rng, int32_t* ncommit, int32_t* cpath,
+                 SpecOut* out, int32_t* hist, const int32_t* pos, cudaStream_t s, const int32_t* par,
+                 const int32_t* budget) {
+  launch_pdl(spec_accept_kernel, dim3(1), dim3(32), 0, s, ids, block_ids, tv, ti, k, ld, choice, smp, rng, ncommit,
+             cpath, out, hist, pos, par, budget);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void penalize_rows(float* tv, int32_t* ti, int ld, const LaneRows& lr, const PenaltyLanes& pl, const SpecTree* trees,
+                   cudaStream_t s, float* raw_v, int32_t* raw_i) {
+  const int rows = lr.max_rows();
+  Q27_CHECK(ld == kMaxK && rows <= kTreeMax && lr.n >= 1 && lr.n <= kMaxLanes, "penalize_rows: out of range");
+  launch_pdl(penalize_rows_kernel, dim3(rows, lr.n), dim3(32), 0, s, tv, ti, ld, lr, pl, trees, raw_v, raw_i);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void spec_logprobs(const LaneRows& lr, const float* logits, int V, const float* tv, const int32_t* ti, int ld,
+                   const LogprobLanes& ln, const SpecTree* trees, const int32_t* cpath, const int32_t* ncommit,
+                   const int32_t* ids, Logprobs* out, const int32_t* par, cudaStream_t s) {
+  const int n = lr.n;
+  Q27_CHECK(n >= 1 && n <= kMaxLanes, "spec_logprobs: 1..8 lanes");
+  for (int z = 0; z < n; z++) Q27_CHECK(ln.n[z] <= std::min(ld, kMaxTopLogprobs), "spec_logprobs: top entries out of range");
+  launch_pdl(spec_logprobs_kernel, dim3(kSpecBlock, n), dim3(kThreads), 0, s, logits, V, tv, ti, ld, lr, ln, trees,
+             cpath, ncommit, ids, out, par);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void count_out(uint32_t* counts, const SpecOut* so, int delta, cudaStream_t s) {
+  launch_pdl(count_out_kernel, dim3(1), dim3(kSpecBlock), 0, s, counts, so, delta);
   Q27_CUDA(cudaGetLastError());
 }
 
@@ -481,19 +682,27 @@ void spec_advance(int32_t* pos, const int32_t* ncommit, int32_t* par, int32_t* s
   Q27_CUDA(cudaGetLastError());
 }
 
-void spec_accept_lanes(int n, int32_t* ids, int32_t* block_ids, const float* tv, const int32_t* ti, int ld,
+void spec_accept_lanes(int32_t* ids, int32_t* anchor, const float* tv, const int32_t* ti, int ld,
                        const AcceptLanes& al, const int32_t* cand, SpecTree* trees, const int32_t* src,
                        const uint64_t* rng, int32_t* ncommit, int32_t* cpath, SpecOut* out, const int32_t* pos,
                        const int32_t* par, const int32_t* budget, cudaStream_t s) {
+  const int n = al.lr.n;
   Q27_CHECK(n >= 1 && n <= kMaxLanes, "spec_accept_lanes: 1..8 lanes");
-  launch_pdl(spec_accept_lanes_kernel, dim3(n), dim3(32), 0, s, ids, block_ids, tv, ti, ld, al, cand, trees, src, rng,
+  launch_pdl(spec_accept_lanes_kernel, dim3(n), dim3(32), 0, s, ids, anchor, tv, ti, ld, al, cand, trees, src, rng,
              ncommit, cpath, out, pos, par, budget);
   Q27_CUDA(cudaGetLastError());
 }
 
-void spec_advance_lanes(int n, int32_t* pos, const int32_t* ncommit, int32_t* par, uint64_t* rng, int32_t* budget,
-                        cudaStream_t s) {
-  launch_pdl(spec_advance_lanes_kernel, dim3(1), dim3(32), 0, s, n, pos, ncommit, par, rng, budget);
+void spec_advance_lanes(const LaneRows& lr, int32_t* pos, const int32_t* ncommit, int32_t* par, uint64_t* rng,
+                        int32_t* budget, int32_t* prow0, cudaStream_t s) {
+  launch_pdl(spec_advance_lanes_kernel, dim3(1), dim3(32), 0, s, lr, pos, ncommit, par, rng, budget, prow0);
+  Q27_CUDA(cudaGetLastError());
+}
+
+void lane_blocks(const LaneRows& lr, const int32_t* anchor, int mask_id, int32_t* block_ids, int32_t* ids,
+                 cudaStream_t s) {
+  Q27_CHECK(lr.total() <= kMaxBatchRows, "lane_blocks: too many rows");
+  launch_pdl(lane_blocks_kernel, dim3(1), dim3(kMaxBatchRows), 0, s, lr, anchor, mask_id, block_ids, ids);
   Q27_CUDA(cudaGetLastError());
 }
 

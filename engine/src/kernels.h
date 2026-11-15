@@ -17,27 +17,100 @@ constexpr size_t kv_row_bytes(KvType t) {
   return t == KvType::BF16 ? 512 : t == KvType::FP8 ? 256 : 128 + 16;  // (head_dim 256)
 }
 
-// Batched speculative steps (P6-10): up to kMaxLanes sequences ("lanes") run one step together, lane z
-// with the kLaneRows verify rows 8 z .. 8 z + 7 of every row buffer. The batched kernels take the lane
-// from a grid dimension (or the row) and its scalars at strided offsets (pos + z, ...); what differs per
-// lane otherwise (states, page tables) comes as pointer arrays.
-constexpr int kMaxLanes = 8;  // MAX_SEQS 1..8 (Phase 7)
-constexpr int kLaneRows = 8;  // a chain verify block (kSpecBlock)
-constexpr int kMaxBatchRows = kMaxLanes * kLaneRows;  // rows of a batched step
+// Batched speculative steps (P6-10): up to kMaxLanes sequences ("lanes") run one step together. Each lane verifies
+// its own block of 2..16 rows (DFlash2: 8): the compute row buffers hold the lanes' rows packed, lane z in
+// rows lr.row0[z] .. lr.row0[z + 1] - 1 (LaneRows, passed by value: a captured step has a fixed layout). The batched
+// kernels take the lane from a grid dimension (or the row) and its scalars at strided offsets (pos + z, ...); what
+// differs per lane otherwise (states, page tables) comes as pointer arrays. What outlives a step (the anchor, the
+// commit path, the grammar masks) sits in per-lane slots of kLaneSlot rows, independent of the layout.
+constexpr int kMaxLanes = 8;      // MAX_SEQS 1..8 (Phase 7)
+constexpr int kLaneSlot = 16;     // a lane's longest block (kSpecBlock)
+constexpr int kMaxBatchRows = 64; // rows of a batched step (the skinny GEMMs)
+// Rows of a batched step with MAX_SEQS = lanes: 8 per lane, at least the 32 of a tree verify (the GDN verify inputs
+// are kept for that many rows anyway), at most kMaxBatchRows.
+constexpr int batch_row_budget(int lanes) {
+  return lanes > 1 ? (8 * lanes < 32 ? 32 : 8 * lanes > kMaxBatchRows ? kMaxBatchRows : 8 * lanes) : 0;
+}
+#if defined(__CUDACC__)
+#define Q27_UNROLL _Pragma("unroll")
+#else
+#define Q27_UNROLL
+#endif
+// (Device code reads row0 at constant indices only, by selects: a dynamic index into a kernel parameter goes through
+// the stack, which cost the batched attention kernel 9 us per call.)
+struct LaneRows {
+  int n = 0;                          // lanes
+  uint8_t row0[kMaxLanes + 1] = {};   // lane z: rows row0[z] .. row0[z + 1] - 1; row0[n] = the total
+  static LaneRows one(int T) {  // (a single sequence: one lane of T rows)
+    LaneRows r;
+    r.n = 1;
+    for (int z = 1; z <= kMaxLanes; z++) r.row0[z] = uint8_t(T);
+    return r;
+  }
+  void set(int nl, const int* rows) {
+    n = nl, row0[0] = 0;
+    for (int z = 0; z < kMaxLanes; z++) row0[z + 1] = uint8_t(row0[z] + (z < nl ? rows[z] : 0));
+  }
+  __host__ __device__ int at(int i) const {  // row0[i], 0 <= i <= kMaxLanes
+    int r = row0[0];
+    Q27_UNROLL
+    for (int j = 1; j <= kMaxLanes; j++) r = i == j ? row0[j] : r;
+    return r;
+  }
+  __host__ __device__ int first(int z) const { return at(z); }
+  __host__ __device__ int rows(int z) const { return at(z + 1) - at(z); }
+  __host__ __device__ int total() const { return at(n); }
+  __host__ __device__ int max_rows() const {
+    int m = 0;
+    Q27_UNROLL
+    for (int j = 0; j < kMaxLanes; j++) m = j < n && row0[j + 1] - row0[j] > m ? row0[j + 1] - row0[j] : m;
+    return m;
+  }
+  __host__ __device__ int lane(int t) const {  // the lane of row t (< total())
+    int z = 0;
+    Q27_UNROLL
+    for (int j = 1; j < kMaxLanes; j++) z += j < n && t >= row0[j];
+    return z;
+  }
+  __host__ __device__ bool is_first(int t) const {  // row t is a block's first (the anchor)
+    bool f = false;
+    Q27_UNROLL
+    for (int j = 0; j < kMaxLanes; j++) f |= j < n && row0[j] == t;
+    return f;
+  }
+  // Drafted positions (block rows past the first): lane z's from pos0(z) on, in all lanes' order.
+  __host__ __device__ int pos0(int z) const { return at(z) - z; }
+  __host__ __device__ int lane_of_pos(int p) const {
+    int z = 0;
+    Q27_UNROLL
+    for (int j = 1; j < kMaxLanes; j++) z += j < n && p >= row0[j] - j;
+    return z;
+  }
+  bool operator==(const LaneRows& o) const {
+    if (n != o.n) return false;
+    for (int z = 0; z <= n; z++)
+      if (row0[z] != o.row0[z]) return false;
+    return true;
+  }
+};
 struct SeqLanes {
   int n = 0;                                   // lanes (0: an unbatched call)
   const int32_t* pos = nullptr;                // [n] committed lengths
   const int32_t* rope_delta = nullptr;         // [n] rotary delta of the images
   const int32_t* page_table[kMaxLanes] = {};   // logical -> physical page of each lane
+  LaneRows lr;                                 // the rows of each lane
 };
 
 // Quantized copy of an activation for the next GEMM (written by the op that produces it).
+// kFp8Row: FP8 with a scale per row (token) from its absolute maximum (amax / 448: the dynamic per-token
+// quantization of compressed-tensors FP8 checkpoints), written to `scale`; in_scale is not used.
 struct QuantOut {
-  enum Kind : int { kNone = 0, kFp8 = 1, kFp4 = 2 };
+  enum Kind : int { kNone = 0, kFp8 = 1, kFp4 = 2, kFp8Row = 3 };
   Kind kind = kNone;
   float in_scale = 1.f;
   uint8_t* q = nullptr;   // fp8 [T][D] / packed e2m1 [T][D/2]
   uint8_t* sf = nullptr;  // NVFP4 only: swizzled scale factors
+  float* scale = nullptr; // kFp8Row only: [T]
 };
 
 // ---------------------------------------------------------------- elementwise (kernels.cu)
@@ -51,26 +124,49 @@ void rmsnorm(const float* x, const bf16* w, int T, int D, float eps, bool zero_c
 // Dynamic NVFP4 quantization (modelopt / FlashInfer numerics, see reference/qwen27b/quant.py):
 // q [M][K/2] packed e2m1 (low nibble = even column), sf in the CUTLASS SM1xx swizzled layout.
 void quant_fp4(const float* x, int M, int K, float input_scale, uint8_t* q, uint8_t* sf, cudaStream_t s);
+// A BF16 weight matrix [M][K] to NVFP4 (Weights::fp4_from_bf16), global = its weight_scale_2 (amax / 2688), the
+// block scales searched for the smallest error. The scale factors of rows m0.. of a larger matrix start at
+// sf + sf_bytes(m0, K / 16) when m0 is a multiple of 128.
+void quant_fp4_weight(const bf16* w, int M, int K, float global, uint8_t* q, uint8_t* sf, cudaStream_t s);
 // Zero-centered RMSNorm over the hidden size (5120) per token, writing the fp32 result to `out` (may be
 // null) and the quantized activation (same numerics as rmsnorm + quant_fp4 / quant_fp8).
 // cap (optional): a BF16 copy of the input rows x (the residual stream), rows cap_ld elements apart.
+// rstd (optional): the per-token 1 / rms ([T]), for linear_bf16_pair's RMSNorm form.
 void rmsnorm_quant(const float* x, const bf16* w, int T, float eps, float* out, QuantOut q, cudaStream_t s,
-                   bf16* cap = nullptr, int cap_ld = 0);
+                   bf16* cap = nullptr, int cap_ld = 0, float* rstd = nullptr);
 // NVFP4 quantization of silu(gate) * up ([T][I], gate / up rows ld floats apart).
 void silu_mul_quant_fp4(const float* gate, const float* up, int64_t ld, int T, int I, float input_scale, uint8_t* q,
                         uint8_t* sf, cudaStream_t s);
 void silu_mul_quant_fp4(const bf16* gate, const bf16* up, int64_t ld, int T, int I, float input_scale, uint8_t* q,
                         uint8_t* sf, cudaStream_t s);
+// The same from the [T][2 I] output of the interleaved gate | up weights (glu_row: gate and up in alternate blocks
+// of 64 rows), with the gate's and the up's alphas applied here (the GEMM ran with alpha 1).
+void silu_mul_quant_fp4_glu(const float* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
+                            uint8_t* q, uint8_t* sf, cudaStream_t s);
+void silu_mul_quant_fp4_glu(const bf16* gu, int T, int I, float alpha_gate, float alpha_up, float input_scale,
+                            uint8_t* q, uint8_t* sf, cudaStream_t s);
 // x' = e4m3(x / input_scale), [n] elements.
 void quant_fp8(const float* x, int64_t n, float input_scale, uint8_t* q, cudaStream_t s);
+// Dynamic per-row FP8 (QuantOut::kFp8Row): scale[t] = amax(row t) / 448 (1 for an all-zero row),
+// q[t] = e4m3(x[t] / scale[t]); x rows ld floats apart, q rows K bytes apart (K a multiple of 16).
+void quant_fp8_rows(const float* x, int64_t ld, int T, int K, uint8_t* q, float* scale, cudaStream_t s);
+// The same of silu(gate) * up ([T][I], gate / up rows ld floats apart): the down GEMM's input of an FP8 MLP.
+void silu_mul_quant_fp8_rows(const float* gate, const float* up, int64_t ld, int T, int I, uint8_t* q, float* scale,
+                             cudaStream_t s);
+// out[r][k] = BF16(e4m3 w[r][k] * scale[r]) for an FP8 weight with per-row (output channel) scales: the input of
+// quant_fp4_weight for an NVFP4 copy (the draft model's view of an FP8 lm_head).
+void dequant_fp8_rows(const uint8_t* w, const float* scale, int rows, int K, bf16* out, cudaStream_t s);
 // out = silu(gate) * up, [n] elements.
 void silu_mul(const float* gate, const float* up, int64_t n, float* out, cudaStream_t s);
 // out[t][n] = x[t] . w[n] for a small BF16 weight [N][K] (GDN in_proj_a / in_proj_b).
 void linear_bf16(const float* x, const bf16* w, int T, int N, int K, float* out, cudaStream_t s);
 // Two BF16 linear layers [N][K] on the same input: outa = x . wa^T, outb = x . wb^T ([T][N] each).
 // T > 8 (N = 48): tensor cores, x as bf16 hi + lo (about 1e-5 relative to the fp32 dots).
+// rstd / norm_w (when linear_bf16_pair_norm_ok(T)): x is the residual stream, the input RMSNorm(x) with the
+// rstd from rmsnorm_quant, bit-identical to passing rmsnorm_quant's fp32 output (P5-17).
 void linear_bf16_pair(const float* x, const bf16* wa, const bf16* wb, int T, int N, int K, float* outa, float* outb,
-                      cudaStream_t s);
+                      cudaStream_t s, const float* rstd = nullptr, const bf16* norm_w = nullptr);
+bool linear_bf16_pair_norm_ok(int T);
 // Debug timeline of the decode step (no-ops unless built with -DQ27_TRACE; see launch.cuh).
 void trace_clear_launches();
 void trace_step_begin(cudaStream_t s);
@@ -82,8 +178,16 @@ void add_pos_dev(int32_t* pos, const int32_t* n, cudaStream_t s);
 // Exchanges two device buffers in place (16-byte aligned, bytes a multiple of 16): parking a sequence's
 // state while resuming another one (Model::seq_swap).
 void swap_bytes(void* a, void* b, size_t bytes, cudaStream_t s);
-// Reorders row-major e4m3 scale factors [rows][kblocks] into the CUTLASS swizzled layout.
-void swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst, cudaStream_t s);
+// The MLP's gate | up weights are stored interleaved (Weights::fp4_glu): blocks of 64 rows, gate and up in turn,
+// so that a 128-row tile (and its 128-row scale atom) holds the gate and the up rows of the same 64 outputs
+// (the fused prefill GEMM gemm_fp4_glu_mma reads one scale atom per tile instead of two half-used ones).
+// Row r of the gate (half 0) or the up (half 1) is row glu_row(r, half); column c of the gate in the GEMM's
+// output is gate_glu_offset(c) (the up 64 further).
+__host__ __device__ inline int64_t glu_row(int64_t r, int half) { return (r / 64) * 128 + half * 64 + r % 64; }
+__host__ __device__ inline int64_t gate_glu_offset(int64_t c) { return glu_row(c, 0); }
+// Reorders row-major e4m3 scale factors [rows][kblocks] into the CUTLASS swizzled layout (glu_half 0 / 1: the
+// rows of the gate / the up into the interleaved gate | up, dst its start).
+void swizzle_sf(const uint8_t* src, int rows, int kblocks, uint8_t* dst, cudaStream_t s, int glu_half = -1);
 // Byte offset of scale factor (row, kblock) in the swizzled layout (host and device).
 __host__ __device__ inline int64_t sf_offset(int64_t row, int64_t kb, int64_t kblocks) {
   int64_t katoms = (kblocks + 3) / 4;
@@ -94,20 +198,28 @@ inline int64_t sf_bytes(int64_t rows, int64_t kblocks) {
   return ((rows + 127) / 128) * 128 * ((kblocks + 3) / 4) * 4;
 }
 
-// ---------------------------------------------------------------- GEMM (gemm.cu, CUTLASS SM120)
+// ---------------------------------------------------------------- GEMM (prefill, gemm_mma.cu)
 
-// D[M][N] = alpha * A[M][K] . B[N][K]^T + beta * C[M][N] (fp32, row-major; C may alias D or be null).
+// D[M][N] = alpha * A[M][K] . B[N][K]^T + beta * C[M][N] (fp32, row-major; C may alias D or be null), on mma.sync
+// (N and K multiples of 128).
 void gemm_fp4(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-              float alpha, const float* c, float beta, float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+              float alpha, const float* c, float beta, float* d, cudaStream_t s);
 // The same with BF16 output (no C).
 void gemm_fp4_bf16(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* b, const uint8_t* b_sf,
-                   float alpha, bf16* d, void* workspace, size_t ws_bytes, cudaStream_t s);
+                   float alpha, bf16* d, cudaStream_t s);
 void gemm_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* b, float alpha, const float* c, float beta,
-              float* d, void* workspace, size_t ws_bytes, cudaStream_t s);
-size_t gemm_workspace_bytes(int max_m);
-// Fills the MXFP8 unit scales of a workspace of gemm_workspace_bytes (gemm_fp8 then runs block-scaled).
-void gemm_workspace_init(void* workspace, size_t ws_bytes, cudaStream_t s);
-// BF16 x BF16 -> fp32 for many rows (gemm_bf16.cu): D[M][N] = alpha * A[M][K] . W[N][K]^T + beta * C.
+              float* d, cudaStream_t s);
+// FP8 with per-row activation scales and per-output-channel weight scales (compressed-tensors FP8 "channel"
+// weights, dynamic "token" activations): D = (A . B^T) * (wscale[n] * ascale[m]) + beta * C.
+void gemm_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* b, const float* wscale,
+                     const float* c, float beta, float* d, cudaStream_t s);
+// The MLP's gate | up GEMM with silu(gate) * up NVFP4-quantized in the epilogue: gate_up is the [2 I][K]
+// weight (gate rows, then up rows; scales likewise), q [M][I / 2] and q_sf (swizzled) the down GEMM's
+// activations, quantized with the global scale out_scale (I a multiple of 128).
+void gemm_fp4_glu(int M, int I, int K, const uint8_t* a, const uint8_t* a_sf, const uint8_t* gate_up,
+                  const uint8_t* gate_up_sf, float alpha_gate, float alpha_up, float out_scale, uint8_t* q,
+                  uint8_t* q_sf, cudaStream_t s);
+// BF16 x BF16 -> fp32 for many rows (N and K multiples of 8): D[M][N] = alpha * A[M][K] . W[N][K]^T + beta * C.
 void gemm_bf16(int M, int N, int K, const bf16* a, const bf16* w, float alpha, const float* c, float beta, float* d,
                cudaStream_t s);
 
@@ -137,6 +249,9 @@ void skinny_fp8(int M, int N, int K, const uint8_t* a, const uint8_t* w, const A
 // scales, per-token activation scales of the dynamic quantization).
 void skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w, const float* wscale,
                        float* d, void* ws, size_t ws_bytes, cudaStream_t s);
+// The same with a residual (+ beta * C): the target's FP8 layers with per-channel scales (gemm_fp8_scaled).
+void skinny_fp8_scaled(int M, int N, int K, const uint8_t* a, const float* ascale, const uint8_t* w, const float* wscale,
+                       const float* c, float beta, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 void skinny_fp4_scaled(int M, int N, int K, const uint8_t* a, const uint8_t* a_sf, const float* ascale, const uint8_t* w,
                        const uint8_t* w_sf, const float* wscale, float* d, void* ws, size_t ws_bytes, cudaStream_t s);
 // BF16 activations [M][K] x BF16 weights [N][K] (the draft model).
@@ -192,13 +307,17 @@ struct GdnSpec {
   const int32_t* sbuf;     // and writes the replayed state to the other (path CTAs may still be reading)
   const SpecTree* tree;    // the current draft tree (rows: nodes)
   int paths;               // tree paths launched (the tree's npaths is at most this)
-  // Batched chain verify (lanes > 0, P6-10): T rows per lane, lane z's rows from kLaneRows * z in every row
-  // buffer (raw / k / v / ab included), its scalars at par + z, ncommit + z, cpath + kLaneRows * z, tree + z,
-  // and its states lconv[z] / lst[z]. A lane's commit is replayed in place (one state buffer: every CTA
-  // reads and writes only its own columns, so nothing else reads it meanwhile); sbuf / st are not used.
+  // Batched chain verify (lanes > 0, P6-10): lane z's rows lr.first(z) .. (lr.rows(z) of them) in every row
+  // buffer (raw / k / v / ab included), its scalars at par + z, ncommit + z, cpath + kLaneSlot * z, tree + z,
+  // and its states lconv[z] / lst[z]. The previous verify's rows of the lane (the commit replayed now) start at
+  // prow0[z] of the other parity's raw / k / v / ab (its layout may differ; written by spec_advance_lanes).
+  // A lane's commit is replayed in place (one state buffer: every CTA reads and writes only its own columns, so
+  // nothing else reads it meanwhile); sbuf / st are not used.
   int lanes = 0;
   float* lconv[kMaxLanes] = {};
   float* lst[kMaxLanes] = {};
+  LaneRows lr;
+  const int32_t* prow0 = nullptr;
 };
 void gdn_verify_prep(const float* qkv, int ld, int T, float* conv_state, const bf16* conv_w, const float* h,
                      const bf16* wa, const bf16* wb, float* q, const GdnSpec& sp, cudaStream_t s);
@@ -258,14 +377,17 @@ constexpr size_t kAttnDecodeWsBytes = size_t(kDecodeMaxT) * 24 * kDecodeMaxSplit
 void attention_decode(const float* q, const float* qg, int ldq, int T, const int32_t* pos_dev, KvLayer kv,
                       KvType kv_type, const int32_t* page_table, float* out, void* ws, size_t ws_bytes,
                       cudaStream_t s, uint8_t* q8 = nullptr, float in_scale = 1.f, const SpecTree* tree = nullptr);
-// Batched chain verify (P6-10): lanes.n blocks of kLaneRows rows (lane z: rows 8 z .., its position, page
-// table and rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
+// Batched chain verify (P6-10): lanes.n blocks (lane z: rows lanes.lr.first(z) .., its position, page table and
+// rotary delta), each computed exactly as attn_prep / attention_decode of that lane alone.
 void attn_prep_lanes(const float* qg, int ldq, const float* k, const float* v, int ldkv, const bf16* q_norm,
                      const bf16* k_norm, const SeqLanes& lanes, KvLayer kv, KvType kv_type, float* q_out,
                      cudaStream_t s);
 void attention_decode_lanes(const float* q, const float* qg, int ldq, const SeqLanes& lanes, KvLayer kv,
                             KvType kv_type, float* out, void* ws, size_t ws_bytes, cudaStream_t s,
                             uint8_t* q8 = nullptr, float in_scale = 1.f);
+// Whether the lanes of a batched verify may have different rows (the FP8-MMA verify of FP8 / NVFP4 KV; read per call,
+// Q27_ATTN_TC_F8). Otherwise every lane has 8.
+bool attention_lanes_vary(KvType kv_type);
 // After a speculative step: the KV of the accepted path (rows cpath[0..*ncommit) of the tree, stored at
 // slots pos + row) moves to pos + i in all nlayers attention layers (layers_dev: device array).
 void kv_commit(KvLayer* layers_dev, int nlayers, KvType kv_type, const int32_t* page_table, const int32_t* pos_dev,
@@ -275,9 +397,67 @@ void kv_commit(KvLayer* layers_dev, int nlayers, KvType kv_type, const int32_t* 
 
 // Per row: log-softmax, then the k most likely tokens (descending). k <= 64.
 void logsoftmax_topk(const float* logits, int T, int V, int k, int32_t* ids, float* logp, cudaStream_t s);
-// Samples one token per row from softmax(logits / temperature) restricted to top_k (1..64) and top_p.
-// temperature <= 0 means greedy. `uniform` holds one U(0,1) number per row.
+// Presence / frequency penalties (OpenAI's, on the logits before the temperature): a token's logit
+// -= presence * (c > 0) + frequency * c, c its count in the sequence's output so far (counts[vocab],
+// which the samplers keep up to date) and, in a verify row, on the row's draft path. They are applied
+// to the 64 highest logits, and top_k is taken from those afterwards.
+struct Penalty {
+  uint32_t* counts = nullptr;  // nullptr: no penalties
+  float presence = 0.f, frequency = 0.f;
+};
+// Samples one token per row from softmax(logits / temperature) restricted to top_k (1..64), min_p (the
+// tokens at least min_p times as likely as the top one) and top_p. temperature <= 0 means greedy.
+// `uniform` holds one U(0,1) number per row. pen (optional): penalties first, and the token is counted.
+// Log-probabilities of output tokens (OpenAI logprobs): the raw distribution of the row a token came from
+// (log-softmax of the logits, before the temperature, the penalties and the cuts), the token's own value and the
+// row's n most likely entries (n = the request's top_logprobs). One per step (up to 16 tokens: a speculative step).
+constexpr int kMaxTopLogprobs = 20;
+constexpr int kLogprobTokens = 16;  // (kSpecBlock)
+struct Logprobs {
+  int32_t n;    // tokens
+  int32_t top;  // top entries per token
+  float lp[kLogprobTokens];
+  int32_t top_id[kLogprobTokens][kMaxTopLogprobs];
+  float top_lp[kLogprobTokens][kMaxTopLogprobs];
+};
+// Where sample() puts the logprobs of its token (T = 1): n top entries (n < 0: none), the row's raw sorted list
+// through scratch tv / ti [kMaxTopLogprobs], the result to *out (mapped host memory).
+struct LogprobSink {
+  int n = -1;
+  float* tv = nullptr;
+  int32_t* ti = nullptr;
+  Logprobs* out = nullptr;
+};
 void sample(const float* logits, int T, int V, float temperature, int top_k, float top_p, const float* uniform,
-            int32_t* out, cudaStream_t s);
+            int32_t* out, cudaStream_t s, float min_p = 0.f, Penalty pen = {}, LogprobSink lp = {});
+// Grammar masks (structured output): row r of logits [rows][V] (lr.total() rows) gets -inf at the tokens whose bit is
+// 0 in row r of mask ([rows][words] bitmasks, bit t % 32 of word t / 32: token t allowed), when the bit of its lane
+// (lr.lane(r)) is set in lanes (other lanes' rows are left).
+void mask_logits(float* logits, int V, const uint32_t* mask, int words, const LaneRows& lr, uint32_t lanes,
+                 cudaStream_t s);
+// Logit bias (OpenAI logit_bias): a sequence's sparse list of (token, value) added to its rows' logits before the
+// grammar mask, the top-k and the penalties (so the logprobs include it, as OpenAI's do). In device memory, so a
+// captured step reads the values of the sequence it runs.
+constexpr int kMaxBias = 300;  // (OpenAI's limit)
+// min_tokens (vLLM's): the end-of-sequence ids eos[] get -inf in a row whose token would be at a sequence position
+// below eos_before (0: none).
+struct alignas(16) BiasList {  // (a multiple of 16 bytes: swap_bytes)
+  int32_t n;
+  int32_t ids[kMaxBias];
+  float vals[kMaxBias];
+  int32_t eos[2];
+  int32_t eos_before;
+};
+// Row r of logits [rows][V] (lr.total() rows, lane z = lr.lane(r)) gets list[z]'s values (nullptr: the lane's rows
+// are left). Its token's position: *pos[z] (the sequence's length: a decode or prompt row), or with depth[z] (verify
+// row j of lane z is tree node j, *pos[z] the anchor's position) *pos[z] + depth[z][j] + 1.
+struct BiasLanes {
+  const BiasList* list[kMaxLanes] = {};
+  const int32_t* pos[kMaxLanes] = {};
+  const int8_t* depth[kMaxLanes] = {};
+};
+void bias_logits(float* logits, int V, const BiasLanes& bl, const LaneRows& lr, cudaStream_t s);
+// counts[ids[i]] += delta for i < n (the penalty counts of a sequence's output).
+void count_tokens(uint32_t* counts, const int32_t* ids, int n, int delta, cudaStream_t s);
 
 }  // namespace q27

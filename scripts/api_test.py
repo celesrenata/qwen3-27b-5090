@@ -3,6 +3,14 @@
 
 OpenAI: streamed tool calls, include_usage, stop strings, completions. Anthropic: messages (non-streaming and
 streaming events), thinking on / off, tool_use -> tool_result turn, stop_sequences, count_tokens, error format.
+tool_choice: a call forced (a named tool, any tool) where the model would answer in text, in the OpenAI chat,
+Anthropic and Responses forms, with thinking on and off.
+structured: response_format (json_schema with thinking on and off, json_object streamed), vLLM structured_outputs
+(choice, regex, completions), Responses text.format, Anthropic output_config.format, JSON or a tool call with tools,
+a bad schema (400), and three masked requests next to a free one giving the text each gives alone.
+controls: logit_bias (a banned answer, 400 on a bad one), vLLM min_tokens and ignore_eos, Responses logprobs (include
+message.output_text.logprobs, plain and streamed), and biased requests next to a free one giving the text each gives
+alone.
 Server: requests run at once give the same greedy text as one at a time (switching sequences is exact), a
 closed connection cancels its request, /v1/models and /metrics.
 
@@ -86,6 +94,13 @@ class Client:
         return events
 
 
+def timings_ok(t, usage):
+    """llama.cpp's timings: the counts agree with usage, and it took time."""
+    return bool(t) and t["prompt_n"] + t["cache_n"] == usage["prompt_tokens"] and t["predicted_n"] == usage["completion_tokens"] \
+        and t["prompt_ms"] > 0 and t["predicted_ms"] > 0 and t["prompt_per_second"] > 0 and t["predicted_per_second"] > 0 \
+        and ("draft_n" not in t or (t["draft_n"] >= 7 and 0 <= t["draft_n_accepted"] <= t["draft_n"]))  # (7 or 15 drafts per step)
+
+
 def openai_tests(cl):
     msgs = [{"role": "user", "content": "Read src/main.py and tell me what it prints. Use the tool."}]
     ev = cl.stream("/v1/chat/completions", {"model": "qwen3.8-27b", "messages": msgs, "tools": TOOLS,
@@ -101,6 +116,13 @@ def openai_tests(cl):
     check("openai stream: reasoning, finish_reason tool_calls, usage chunk",
           bool(reasoning) and finish == ["tool_calls"] and len(usage) == 1 and usage[0]["completion_tokens"] > 0,
           f"reasoning {len(reasoning)} chars, finish {finish}, usage {usage}")
+    check("openai stream: timings on the last chunk only", timings_ok(ev[-1][1].get("timings"), usage[0] if usage else {})
+          and sum("timings" in e for _, e in ev) == 1, json.dumps(ev[-1][1])[:300])
+    ev = cl.stream("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 32,
+                                            "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    check("openai stream: timings without include_usage, on the finish_reason chunk",
+          "timings" in ev[-1][1] and ev[-1][1]["choices"][0]["finish_reason"] is not None
+          and sum("timings" in e for _, e in ev) == 1, json.dumps(ev[-1][1])[:300])
 
     st, r = cl.post("/v1/chat/completions", {"model": "x", "messages": [{"role": "user", "content": "Count from 1 to 20, comma separated."}],
                                              "max_tokens": 200, "temperature": 0, "stop": ["7"],
@@ -108,9 +130,11 @@ def openai_tests(cl):
     content = r["choices"][0]["message"]["content"] if st == 200 else r
     check("openai: stop string ends the text before it", st == 200 and "7" not in content and "6" in content
           and r["choices"][0]["finish_reason"] == "stop", repr(content))
+    check("openai: timings with a stop string", st == 200 and timings_ok(r.get("timings"), r["usage"]), str(r.get("timings")))
 
     st, r = cl.post("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 8, "temperature": 0})
     check("openai: completions", st == 200 and "Paris" in r["choices"][0]["text"], repr(r["choices"][0]["text"]) if st == 200 else r)
+    check("openai: completions timings", st == 200 and timings_ok(r.get("timings"), r["usage"]), str(r.get("timings")))
 
     st, r = cl.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "n": 2})
     check("openai: unsupported n gives 400 in the OpenAI error format", st == 400 and "error" in r, str(r))
@@ -259,18 +283,225 @@ def cancel_tests(cl):
     check("a closed non-streaming request is cancelled", metric('q27:requests_finished_total{reason="cancelled"}') > before)
 
 
+def tool_choice_tests(cl):
+    """A question the model answers without tools: the tool_choice forces a call anyway."""
+    tools = TOOLS + [{"type": "function", "function": {"name": "list_dir", "description": "List a directory.",
+                                                       "parameters": {"type": "object", "properties": {
+                                                           "path": {"type": "string"}}, "required": ["path"]}}}]
+    q = [{"role": "user", "content": "What is 17 + 25? Answer with the number only."}]
+    named = {"type": "function", "function": {"name": "list_dir"}}
+
+    def metric(name):
+        _, text = cl.get("/metrics")
+        return sum(float(line.split()[-1]) for line in text.splitlines() if line.startswith(name))
+
+    forced0 = metric("q27:forced_outputs_total")
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "tools": tools, "tool_choice": named, "max_tokens": 2048,
+                                             "temperature": 0, "logprobs": True, "top_logprobs": 2})
+    ch = r["choices"][0] if st == 200 else {}
+    msg, calls = ch.get("message", {}), ch.get("message", {}).get("tool_calls") or []
+    check("tool_choice: openai named, thinking on: one call of that tool after the reasoning",
+          st == 200 and len(calls) == 1 and calls[0]["function"]["name"] == "list_dir" and bool(msg.get("reasoning_content"))
+          and not msg.get("content") and ch["finish_reason"] == "tool_calls", json.dumps(r)[:400])
+    check("tool_choice: logprobs cover the forced tokens too",
+          st == 200 and len(ch["logprobs"]["content"]) == r["usage"]["completion_tokens"]
+          and any(e["logprob"] == 0.0 and e["token"] == "<tool_call>" for e in ch["logprobs"]["content"]),
+          f"{len((ch.get('logprobs') or {}).get('content') or [])} entries, usage {r.get('usage')}")
+    check("tool_choice: the forced output counted (q27:forced_outputs_total)", metric("q27:forced_outputs_total") == forced0 + 1)
+
+    ev = cl.stream("/v1/chat/completions", {"messages": q, "tools": tools, "tool_choice": "required", "max_tokens": 512,
+                                            "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    calls = [tc for _, e in ev for c in e.get("choices", []) for tc in c["delta"].get("tool_calls", [])]
+    finish = [c["finish_reason"] for _, e in ev for c in e.get("choices", []) if c.get("finish_reason")]
+    check("tool_choice: openai required, stream, thinking off: a call of one of the tools",
+          bool(calls) and calls[0]["function"]["name"] in ("read_file", "list_dir") and finish == ["tool_calls"],
+          json.dumps(calls)[:300])
+
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "tools": tools, "tool_choice": "none", "max_tokens": 512,
+                                             "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    check("tool_choice: none answers in text", st == 200 and "42" in (r["choices"][0]["message"]["content"] or "")
+          and not r["choices"][0]["message"].get("tool_calls"), json.dumps(r)[:300])
+
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "tools": tools, "max_tokens": 8,
+                                             "tool_choice": {"type": "function", "function": {"name": "write_file"}}})
+    check("tool_choice: an unknown tool gives 400", st == 400 and "write_file" in r["error"]["message"], str(r))
+
+    a_tools = A_TOOLS + [{"name": "list_dir", "description": "List a directory.",
+                          "input_schema": tools[1]["function"]["parameters"]}]
+    base = {"model": "x", "max_tokens": 2048, "temperature": 0, "messages": q, "tools": a_tools}
+    st, r = cl.post("/v1/messages", dict(base, tool_choice={"type": "any"}, thinking={"type": "enabled", "budget_tokens": 1024}))
+    blocks = r.get("content", []) if st == 200 else []
+    check("tool_choice: anthropic any, thinking on: thinking then tool_use",
+          st == 200 and [b["type"] for b in blocks][:1] == ["thinking"] and any(b["type"] == "tool_use" for b in blocks)
+          and r["stop_reason"] == "tool_use", json.dumps(r)[:400])
+    ev = cl.stream("/v1/messages", dict(base, tool_choice={"type": "tool", "name": "read_file"}, thinking={"type": "disabled"}))
+    starts = [e["content_block"] for _, e in ev if e.get("type") == "content_block_start"]
+    stop = [e["delta"]["stop_reason"] for _, e in ev if e.get("type") == "message_delta"]
+    check("tool_choice: anthropic tool, stream, thinking off: one tool_use of that tool",
+          [b["type"] for b in starts] == ["tool_use"] and starts[0]["name"] == "read_file" and stop == ["tool_use"],
+          json.dumps(starts)[:300])
+
+    r_tools = [{"type": "function", "name": t["function"]["name"], "description": t["function"]["description"],
+                "parameters": t["function"]["parameters"]} for t in tools]
+    st, r = cl.post("/v1/responses", {"input": q[0]["content"], "tools": r_tools, "max_output_tokens": 2048, "temperature": 0,
+                                      "tool_choice": {"type": "function", "name": "list_dir"}})
+    items = r.get("output", []) if st == 200 else []
+    calls = [it for it in items if it["type"] == "function_call"]
+    check("tool_choice: responses named function: one function_call of that tool",
+          st == 200 and len(calls) == 1 and calls[0]["name"] == "list_dir" and r["status"] == "completed", json.dumps(r)[:400])
+
+
+def structured_tests(cl):
+    """Prompts that would not give the format on their own: the masks make the output follow it."""
+    schema = {"type": "object", "properties": {"city": {"type": "string"}, "population": {"type": "integer"},
+                                               "landmarks": {"type": "array", "items": {"type": "string"}, "maxItems": 3}},
+              "required": ["city", "population", "landmarks"], "additionalProperties": False}
+    q = [{"role": "user", "content": "Tell me about Kyoto in two sentences."}]
+    rf = {"type": "json_schema", "json_schema": {"name": "city", "schema": schema, "strict": True}}
+
+    def fits(text):
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            return False
+        return set(obj) == {"city", "population", "landmarks"} and isinstance(obj["population"], int)
+
+    for thinking in (False, True):
+        st, r = cl.post("/v1/chat/completions", {"messages": q, "response_format": rf, "max_tokens": 4096, "temperature": 0,
+                                                 "chat_template_kwargs": {"enable_thinking": thinking}})
+        msg = r["choices"][0]["message"] if st == 200 else {}
+        check(f"structured: openai json_schema, thinking {'on' if thinking else 'off'}",
+              st == 200 and fits(msg.get("content")) and r["choices"][0]["finish_reason"] == "stop"
+              and (bool(msg.get("reasoning_content")) == thinking), json.dumps(r)[:400])
+    ev = cl.stream("/v1/chat/completions", {"messages": q, "response_format": {"type": "json_object"}, "max_tokens": 1024,
+                                            "temperature": 0.7, "seed": 3, "chat_template_kwargs": {"enable_thinking": False}})
+    text = "".join(c["delta"].get("content") or "" for _, e in ev for c in e.get("choices", []))
+    try:
+        good = isinstance(json.loads(text), dict)
+    except ValueError:
+        good = False
+    check("structured: openai json_object, stream, sampled: a JSON object", good, text[:300])
+    q2 = [{"role": "user", "content": "Is Kyoto the capital of Japan? Explain."}]
+    st, r = cl.post("/v1/chat/completions", {"messages": q2, "structured_outputs": {"choice": ["yes", "no"]}, "max_tokens": 2048,
+                                             "temperature": 0})
+    check("structured: vllm choice", st == 200 and r["choices"][0]["message"]["content"] in ("yes", "no"), json.dumps(r)[:300])
+    st, r = cl.post("/v1/completions", {"prompt": "The date of the Meiji Restoration was", "max_tokens": 32, "temperature": 0,
+                                        "structured_outputs": {"regex": " [0-9]{4}-[0-9]{2}-[0-9]{2}"}})
+    text = r["choices"][0]["text"] if st == 200 else ""
+    check("structured: vllm regex, completions", st == 200 and len(text) == 11 and text[5] == "-" and text[8] == "-", text)
+    st, r = cl.post("/v1/responses", {"input": q[0]["content"], "max_output_tokens": 4096, "temperature": 0,
+                                      "text": {"format": {"type": "json_schema", "name": "city", "schema": schema}}})
+    out = [c["text"] for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] if st == 200 else []
+    check("structured: responses text.format", st == 200 and len(out) == 1 and fits(out[0]), json.dumps(r)[:400])
+    st, r = cl.post("/v1/messages", {"model": "x", "max_tokens": 4096, "temperature": 0, "messages": q,
+                                     "output_config": {"format": {"type": "json_schema", "schema": schema}}})
+    texts = [b["text"] for b in r.get("content", []) if b["type"] == "text"] if st == 200 else []
+    check("structured: anthropic output_config.format", st == 200 and len(texts) == 1 and fits(texts[0]), json.dumps(r)[:400])
+    q3 = [{"role": "user", "content": "Read README.md and tell me what it says."}]
+    st, r = cl.post("/v1/chat/completions", {"messages": q3, "tools": TOOLS, "response_format": rf, "max_tokens": 4096,
+                                             "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    msg = r["choices"][0]["message"] if st == 200 else {}
+    check("structured: with tools, a tool call or the format",
+          st == 200 and (bool(msg.get("tool_calls")) or fits(msg.get("content"))), json.dumps(r)[:400])
+    st, r = cl.post("/v1/chat/completions", {"messages": q, "max_tokens": 8,
+                                             "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "nonsense"}}}})
+    check("structured: a bad schema gives 400", st == 400 and "nonsense" in r["error"]["message"], str(r))
+    # Masked and free requests at once (batched steps) give the greedy text each gives alone.
+    bodies = [{"messages": q, "response_format": rf, "max_tokens": 256, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}},
+              {"messages": [{"role": "user", "content": "Write a haiku about Kyoto."}], "max_tokens": 128, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}},
+              {"messages": q2, "structured_outputs": {"choice": ["yes", "no"]}, "max_tokens": 64, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}},
+              {"messages": [{"role": "user", "content": "List five fruits."}], "response_format": {"type": "json_object"},
+               "max_tokens": 256, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}]
+
+    def text_of(b):
+        st, r = cl.post("/v1/chat/completions", b)
+        return r["choices"][0]["message"]["content"] if st == 200 else f"error {st}"
+    alone = [text_of(b) for b in bodies]
+    with cf.ThreadPoolExecutor(len(bodies)) as ex:
+        together = list(ex.map(text_of, bodies))
+    check("structured: 3 masked + 1 free at once give the text of each alone", alone == together,
+          json.dumps([a[:80] for a in alone]) + " vs " + json.dumps([t[:80] for t in together]))
+
+
+def controls_tests(cl):
+    off = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+    q = [{"role": "user", "content": "What is the capital of France? Answer with the city's name only."}]
+
+    def chat(**kw):
+        st, r = cl.post("/v1/chat/completions", dict(off, messages=q, max_tokens=32, **kw))
+        return st, r, (r["choices"][0]["message"]["content"] if st == 200 else "")
+    _, _, base = chat()
+    ban = {}
+    for word in ("Paris", " Paris", "PAR", "Par"):
+        _, t = cl.post("/tokenize", {"prompt": word})
+        ban[str(t["tokens"][0])] = -100
+    st, r, text = chat(logit_bias=ban)
+    check("controls: logit_bias bans the answer's first token", st == 200 and "Paris" in base and not text.startswith("Paris"),
+          f"{base!r} -> {text!r}")
+    st, r, _ = chat(logit_bias={"999999999": 1})
+    check("controls: logit_bias out of the vocabulary gives 400", st == 400, str(r)[:200])
+    q2 = [{"role": "user", "content": "Say hi."}]
+    st, r = cl.post("/v1/chat/completions", dict(off, messages=q2, max_tokens=64))
+    n0 = r["usage"]["completion_tokens"] if st == 200 else 0
+    st, r = cl.post("/v1/chat/completions", dict(off, messages=q2, max_tokens=64, min_tokens=24))
+    n1 = r["usage"]["completion_tokens"] if st == 200 else 0
+    check("controls: min_tokens", st == 200 and n0 < 24 <= n1, f"{n0} -> {n1} tokens")
+    st, r = cl.post("/v1/chat/completions", dict(off, messages=q2, max_tokens=40, ignore_eos=True))
+    msg = r["choices"][0] if st == 200 else {}
+    check("controls: ignore_eos runs to max_tokens without the end's text",
+          st == 200 and r["usage"]["completion_tokens"] == 40 and msg["finish_reason"] == "length"
+          and "<|im_end|>" not in (msg["message"]["content"] or ""), json.dumps(r)[:300])
+    st, r = cl.post("/v1/completions", {"prompt": "The capital of France is", "max_tokens": 24, "temperature": 0,
+                                        "ignore_eos": True, "min_tokens": 24})
+    check("controls: completions min_tokens / ignore_eos", st == 200 and r["usage"]["completion_tokens"] == 24, json.dumps(r)[:200])
+    # Responses logprobs
+    body = {"input": "Name three colors.", "max_output_tokens": 64, "temperature": 0, "reasoning": {"effort": "none"},
+            "include": ["message.output_text.logprobs"], "top_logprobs": 2}
+    st, r = cl.post("/v1/responses", body)
+    parts = [c for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] if st == 200 else []
+    lps = parts[0]["logprobs"] if parts else []
+    check("controls: responses logprobs", st == 200 and lps and "".join(e["token"] for e in lps) == parts[0]["text"]
+          and all(len(e["top_logprobs"]) == 2 and e["logprob"] <= 0 for e in lps), json.dumps(r)[:300])
+    ev = cl.stream("/v1/responses", body)
+    deltas = [e for _, e in ev if e.get("type") == "response.output_text.delta"]
+    text = "".join(d["delta"] for d in deltas)
+    check("controls: responses logprobs, streamed", deltas and "".join(x["token"] for d in deltas for x in d["logprobs"]) == text
+          and parts and text == parts[0]["text"], text[:200])
+    st, r = cl.post("/v1/responses", dict(body, include=[]))
+    parts = [c for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] if st == 200 else []
+    check("controls: responses without the include: no logprobs", st == 200 and parts and parts[0]["logprobs"] == [])
+    # Biased and free requests at once (batched steps) give the text each gives alone.
+    bodies = [dict(off, messages=q, max_tokens=32, logit_bias=ban),
+              dict(off, messages=[{"role": "user", "content": "Write a haiku about Kyoto."}], max_tokens=96),
+              dict(off, messages=q2, max_tokens=48, min_tokens=30),
+              dict(off, messages=[{"role": "user", "content": "List five fruits."}], max_tokens=96,
+                   logit_bias={k: -5 for k in ban})]
+
+    def text_of(b):
+        st, r = cl.post("/v1/chat/completions", b)
+        return r["choices"][0]["message"]["content"] if st == 200 else f"error {st}"
+    alone = [text_of(b) for b in bodies]
+    with cf.ThreadPoolExecutor(len(bodies)) as ex:
+        together = list(ex.map(text_of, bodies))
+    check("controls: 3 biased + 1 free at once give the text of each alone", alone == together,
+          json.dumps([a[:80] for a in alone]) + " vs " + json.dumps([t[:80] for t in together]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
-    ap.add_argument("--only", default="openai,anthropic,concurrency,cancel")
+    ap.add_argument("--only", default="openai,anthropic,tool_choice,structured,controls,concurrency,cancel")
     args = ap.parse_args()
     cl = Client(args.base_url)
     st, models = cl.get("/v1/models")
     m = json.loads(models)["data"][0]
     check("/v1/models", st == 200 and m["id"] == "qwen3.8-27b" and m["max_model_len"] > 0, f"{m['id']} {m['max_model_len']}")
     for part in args.only.split(","):
-        {"openai": openai_tests, "anthropic": anthropic_tests, "concurrency": concurrency_tests,
-         "cancel": cancel_tests}[part](cl)
+        {"openai": openai_tests, "anthropic": anthropic_tests, "tool_choice": tool_choice_tests,
+         "structured": structured_tests, "controls": controls_tests, "concurrency": concurrency_tests, "cancel": cancel_tests}[part](cl)
     print("PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
     sys.exit(1 if FAILS else 0)
 

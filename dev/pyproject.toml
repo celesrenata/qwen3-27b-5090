@@ -13,6 +13,8 @@ dependencies = [
   "numpy==2.5.3",
   "pytest",
   "httpx",
+  "llguidance==1.9.1",  # grammar masks of structured output (frontend)
+  "av==19.0.2",  # video decoding: the reference of the engine's (frontend/tests/test_videoproc.py)
 ]
 
 [tool.uv]

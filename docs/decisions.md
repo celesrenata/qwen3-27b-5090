@@ -11,7 +11,7 @@ development:
 | 0 | Measurements of the GPU (bandwidth, MMA peaks, PCIe, the WSL2 memory limit), the reference model, golden recordings |
 | 1 | A working engine: loader, memory plan, straightforward kernels, decode and prefill without speculation |
 | 2 | Decode speed: skinny GEMMs, fused kernels, CUDA graphs and PDL |
-| 3 | Speculative decoding with DFlash2 |
+| 3 | Speculative decoding with DFlash2 (DSpine, the default since, came later) |
 | 4 | Memory: prefix cache, NVFP4 KV cache, vision tower |
 | 5 | Prefill speed |
 | 6 | Serving: API server, scheduler, several requests at once |
@@ -105,11 +105,49 @@ gate without an explicit decision, recorded below with its numbers.
   decode +0.2 to 1.4%. Golden on the decode path against the BF16 original: KL 0.0344 -> 0.0359; needle retrieval
   at 256K 56 -> 57 of 64. With the FP8 KV cache the verify is already near its read time and gains 0 to 2%, so it
   is not the default there (`Q27_ATTN_TC_F8=1`). Rows of one token stay bit-identical across 1 to 8 tokens.
+- **P3-36: the 16-row verify attention (DSpine).** A verify of 11 to 16 rows needs 5 or 6 compute warps of 16 rows.
+  With 4 producer warps that instance was capped at 168 registers (3 warps per SMSP) and spilled; with 2 producer
+  warps it keeps 255 registers: one NVFP4 layer at 32K keys, 16 rows, 93.9 -> 50.2 us (8 rows: 44.4 us), DSpine's
+  step on code at 32K 15.02 -> 14.50 ms with the same tokens. The FP8 MMAs are now also the default with the FP8 KV
+  cache: the BF16 / F16 kernel took a 16-row verify as two launches of 8 rows (106 vs 63 us per layer at 32K), while
+  1 and 8 rows are as fast or faster (golden on the decode path unchanged: KL 0.0336 -> 0.0332, P7-7).
+  The adaptive verify width now switches at a step that does not depend on the scheduling (a step launched ahead or
+  dropped by a parked sequence), so a sequence takes the same steps alone or interleaved with others.
 - **P5-11 for decode: not adopted.** The block-scaled FP8 MMA is twice as fast for prefill, but decode is
   bandwidth-bound and gained nothing, so the skinny GEMMs kept the plain FP8 MMA.
 
 ## Speculative decoding
 
+- **DSpine as the default draft, with an adaptive verify width** (2026-11). DSpine (the DFlash backbone with a code bridge
+  after every layer, blocks of 16) accepts far more tokens on code and JSON (JSON 10.4 against 6.5 tokens per step with
+  the default sampling), but a 16-row verify costs about 1.5 ms more per step than 8 rows here (12.5 ms), so on prose
+  and Japanese prose it lost to DFlash2 (0.88 and 0.99 times). Switching a request between 16 and 8 rows from the
+  moving average of its tokens per step fixed that: against DFlash2, code 1.19, JSON 1.46, ja-code 1.22, Japanese
+  1.06 and prose 1.00 times (one request, sampled), after two fixes in the draft: its table kernel decoded FP4 through
+  a table in local memory (270 -> 37 us), and the candidates' sender projections now come from a table built at load
+  for the draft vocabulary (256 MB) instead of codebook rows read over PCIe. Batched steps of several
+  requests draft 8 rows each; there DSpine accepts fewer tokens than DFlash2, and through the server the sum of
+  four and eight concurrent sampled requests was 0.96 and 0.94 times DFlash2's (one request 1.15 times; 2026-11-13). DSpine stays the default because one request at a time is
+  the common case (a coding agent), and `SPEC=dflash2` remains for servers that mostly batch. Since then (2026-11-14,
+  P3-38) each request of a batched step verifies 4, 8, 12 or 16 rows of its own. A step costs by its total rows in
+  steps of 16 (not per row), so the rule searches moves of one lane at a time against a model of that cost, every 8
+  steps, with a 1% hysteresis: deciding at every step changed the split nearly every step, and each change updates
+  the CUDA graph (1.2 ms). Each lane keeps its measured tokens per width it ran, averaged at 1/32: a first version
+  extrapolated every width from the current one and averaged at the single request's 1/8, and four sampled
+  reasoning requests lost 5% (reasoning gains almost nothing from wider blocks, and lanes of one kind looked
+  different by chance); now -1.7% (in-process). Against 8 rows each, greedy (the same output, so the comparison
+  pairs): mixed prompts +9.1% / +4.3% at 4 / 8 requests, four code requests +20.6%, eight Japanese +4.4%. Through the
+  server on reasoning ([benchmarks.md](benchmarks.md#concurrent-requests)) four and eight requests are as fast as with
+  v0.5.0 (899-901 and 1,313-1,314 tok/s), and DFlash2 is still 3% and 6% faster there. The width depends only on past steps, so the output distribution
+  is unchanged (greedy output is identical to plain decoding; a chi-square test of the sampled tokens passes). The
+  table of candidates is computed exactly for the 15 x 16 x 16 (position, sender, candidate) triples instead of
+  DSpine's reference tables over the whole vocabulary (0.76 GB), and the 0.5 GB codebook stays in host memory.
+  At a 32K context (greedy, the same output for both drafts) DSpine stays ahead on code and JSON (1.21 and 1.28 times)
+  and Japanese (1.14), but prose is 0.93 times (DSpine accepts fewer prose tokens there: 3.07 against 3.26) and four
+  concurrent requests 0.97 to 0.99 times. Of a 16-row verify's extra 0.6 ms, the skinny GEMMs (+0.3) and the GDN
+  recurrence, sequential per token, take most; no split-K setting or batching of the GDN preparation helped.
+  DSpine was trained with an 8,192-token window; served with 2,048 it accepts as many tokens at 32K with 0.2-0.3 ms
+  shorter steps and a 40 MiB context ring per request instead of 160, so 2,048 is the default (`Q27_DRAFT_WINDOW`).
 - **DFlash2 with an 8-row chain** (Phase 3). The chain verify was built first, with every verify row
   bit-identical to the decode of the same token, so greedy speculative decoding must reproduce plain decoding
   exactly (a strict test). Short-context decode came out 1.36 to 1.62 times SGLang's DFlash2 on the same GPU.
@@ -210,7 +248,7 @@ gate without an explicit decision, recorded below with its numbers.
   most 63 extra tokens and stays bit-identical.
 - **P5-3: CUTLASS tiles unchanged.** FP4 GEMMs hold the SM clock at about 1.79 GHz at 400 W (power throttling);
   corrected for the clock they run at about 87% of the MMA peak. Of nine tile, schedule and split configurations
-  (`micro/gemm_tune.cu`), only BF16 output was faster (2 to 9%), used where the next step needs no more (the MLP's
+  (`micro/gemm_tune.cu`, removed with CUTLASS), only BF16 output was faster (2 to 9%), used where the next step needs no more (the MLP's
   gate / up, which only feed SiLU and FP4 quantization).
 - **P5-4: chunks of 2,048 tokens.** At 32K, chunks of 2,048 / 4,096 / 8,192 took 4.66 / 4.60 / 4.54 s: 2.5% for 4
   times the activation memory.
@@ -243,11 +281,71 @@ gate without an explicit decision, recorded below with its numbers.
     along the keys the MMA reduces over.
   - (C, dropped) A softmax per 64 keys (half the output rescales): -0.5 to 1.5%, within noise. Three heads per CTA
     ran out of registers.
+- **P5-12: the MLP's gate | up stored interleaved (blocks of 64 rows, gate and up in turn).** The fused prefill
+  GEMM (`gemm_fp4_glu_mma`, `Q27_MLP_FUSED=1`, the default since 2026-10-28: gate | up, then silu(gate) * up NVFP4-quantized in the epilogue)
+  needs the gate and the up rows of the same outputs in one tile. With the two stored apart, a 128-row tile took
+  half of a gate and half of an up scale atom (the NVFP4 scale layout groups 128 rows), 50% more B-scale bytes per
+  K step: the interleaved layout makes it one atom, -3.8% time and about -2% energy per call. The loader places
+  the rows (no extra memory), the GEMMs on gate | up run with alpha 1 and the SiLU step applies the gate's and the
+  up's. Decode and the fused prefill are bit-identical to before; the BF16 prefill (`Q27_MLP_FUSED=0`) now writes
+  one BF16 gate | up (KL to the previous engine 0.048, to the BF16 original unchanged). With the fused path, prefill
+  at 19K / 73K is 2.2 / 1.7% faster and uses 2.1% less energy per token than the BF16 path. Quality against it:
+  GSM8K 95.3 / 95.3%, BFCL 88.9 / 89.1%, Japanese reference scores within their CIs (JSQuAD F1 +1.6), needles at
+  256K 56 / 58 of 64, KL to the BF16 original 0.0470 / 0.0454.
+- **P5-12: own GEMMs for every many-row GEMM; CUTLASS optional.** `gemm_mma.cu` now also runs E4M3 (the block-scaled
+  MMA with unit scales) and BF16 (the draft's context, vision; any N and K through TMA's edge handling) with the same
+  tiles and epilogue: the m16n8k32 E4M3 and m16n8k16 BF16 fragments hold the same bytes per K step as the NVFP4 k64
+  ones. Results are bit-identical to CUTLASS. CUTLASS (SM120 3.x and the 2.x BF16 kernel) is built with
+  `-DQ27_CUTLASS_GEMM=ON` (default; off for MSVC, which cannot compile CuTe) and chosen per call with
+  `Q27_GEMM_CUTLASS` (default 1 in such builds). At 400 W the own E4M3 GEMM is 1.5-5.6% faster than CUTLASS's MXFP8
+  one; the own NVFP4 and BF16 GEMMs are 1-3% slower: same L2 traffic and active cycles at a fixed clock, but more
+  power per cycle, so a lower clock at the power limit. Two changes closed part of the gap: a suspend-time hint on
+  the mbarrier waits (as CUTLASS's; spinning waits were ~20% of the instructions) and a 2 KiB epilogue staging per
+  warp (one more ring stage). The fused MLP GEMM's epilogue dropped denormal handling it never needs (ftz exp2 and
+  reciprocal, a branch-free division by 6; bit-identical): -28% of its instructions, -0.9% time.
+  Later the rest of the gap was found in the K loop's integer instructions: the stage addresses and barrier phases ran
+  on the vector datapath (~30 instructions per 32 MMAs), CUTLASS's on the uniform one. With the warp index made
+  warp-uniform (`__shfl_sync`, as CUTLASS's `canonical_warp_idx_sync`), the empty-barrier arrive predicated instead of
+  branched and only the per-lane offsets kept opaque to the compiler, the loop has no vector integer arithmetic left
+  and the NVFP4 GEMMs lost 1.5-2% of their energy. The tile order then mattered by 2-5%: N fastest (the CTAs running
+  at the same time share activation rows) beats M fastest except where the weights do not stay in L2 between the
+  passes (the fused gate | up, 89 MB: M fastest there). At 400 W, against CUTLASS: NVFP4 gdn qkv / out / down -2.5 to
+  -3.6%, gdn z +1.8%; E4M3 -4.3 to -7%; BF16 +0.5-1.1%; the fused MLP GEMM -3% against its previous version.
+  Prefill with all own kernels: +0.6% / +0.0% at 19K / 73K.
+- **P5-12: CUTLASS removed.** With the own GEMMs as fast as CUTLASS's in the prefill and bit-identical, `gemm.cu`,
+  `gemm_bf16.cu`, the CMake option, the GEMM workspace, `Q27_GEMM_CUTLASS` / `Q27_GEMM_MXFP8` and CUTLASS in both
+  images went; the engine builds with the CUDA toolkit alone (a precondition for MSVC, which cannot compile CuTe).
+  Last tries on gdn z (N 6,144, the one shape still 1.8-2.7% slower; identical at a fixed clock, time, L2 bytes and
+  instructions alike): one GEMM for qkv | z (slower than the two), as many tiles on every CTA (154 x 5), a dynamic
+  tile counter, the producer's loads from an elected lane without the per-lane loop the lane-0 branch compiled to
+  (14% of the instructions: kept, but no faster). As a pair qkv and z are 1.7% faster than CUTLASS's.
+- **P5-14: the GDN chunk prep writes only (I + L)^-1.** The P5-2 prep solved [W | U] for 256 columns and wrote
+  W, U, M and BF16 q / k: 188 MB for one layer of 2,048 tokens, so its 121 us were memory time. With A = (I + L)^-1,
+  delta = U - W S = A (diag(beta) V - diag(beta e^gamma) K S): the chunk kernel computes K S (K is already in shared
+  memory for the state update) and multiplies by A, so W and U are never written (prep 121 -> 53 us, 76 MB). The
+  extra product runs on F16 MMAs with each state column of X scaled by a power of 2, which keeps the error against
+  the FP64 recurrence at the old level (o 3.5e-3, state 2.6e-3; BF16 operands there gave 3.9e-3 / 3.1e-3). The
+  inverse is solved by four lanes per column, rows interleaved and L read as float4 (a lane per column: 66 us).
+  One layer 256 -> 187 us of kernel time; prefill 19K +1.9%, 73K +1.1%; golden against BF16 KL 0.0454 -> 0.0459
+  (two builds of the same code differ by 0.047). F16 accumulators (twice the MMA rate, `micro/mma_peak`) are not
+  used yet; the chunk kernel holds 250 registers, and adding a bound-based scale there spilled (+30 us).
+- **P5-16: in_proj_a / b split over K.** The prefill kernel ran a block per 32 tokens through all 5,120 k in
+  80 steps of about 0.9 us whatever the pipeline depth (a latency chain at 12 warps per SM): 77 us at any T > 8.
+  Blocks of 16 tokens and a quarter of K, the four of a token tile in a cluster, block 0 adding the partial sums
+  in order from the others' shared memory (no workspace; plain distributed shared memory loads, not the bulk
+  copies that compile to driver calls): 18 us for 16 tokens, 45 us for 2,048. Prompts of 128 / 512 tokens
+  +7.4 / +6.4%; at 19K the gain (-17 ms of kernel time) is taken back by the power limit (+0.4%, energy per token
+  unchanged). Error against FP64 1.2e-5 -> 3.7e-6; golden KL against BF16 0.0467 (noise).
+- **P5-17: in_proj_a / b normalizes the residual itself.** The GDN layer's input RMSNorm wrote its FP32 rows
+  (42 MB per 2,048 tokens) only for in_proj_a / b. In the prefill it now writes 1 / rms per token, and the
+  in_proj_a / b kernel forms (x rstd) (1 + w) per element as the RMSNorm does: bit-identical, the norm 10.7 ms
+  less at 19K, in_proj_a / b 1.8 ms more; 19K +0.5%, energy per token -0.8%. The verify and decode preps still
+  read the normed rows.
 - **Not done: FP4 attention for P V (SageAttention3 style), a megakernel.** See [Not done](#not-done).
 
 ## Vision
 
-- **P4-12: the vision tower** (`VISION=off / host / fp8 / bf16`): the ViT on BF16 CUTLASS GEMMs with FP32
+- **P4-12: the vision tower** (`VISION=off / host / fp8 / bf16`): the ViT on BF16 GEMMs (CUTLASS's until P5-12) with FP32
   residuals and LayerNorm, a non-causal flash attention per image (head dimension 72 padded to 80 in shared
   memory), M-RoPE. One image per call, so no variable-length attention is needed. Its workspace (305 MiB for a
   4,096-token image) reuses the prefill activations.
@@ -269,6 +367,41 @@ gate without an explicit decision, recorded below with its numbers.
   (finer scales still left 3.6%: the 3-bit mantissa dominates). On 70 synthetic questions with exact answers:
   `bf16` and `host` 67 (identical replies), `fp8` 68, vLLM 70; the differences are three close counting questions
   that the FP32 reference model also misses the same way.
+
+- **P4-16: videos** (`video_url`). A pair of frames is an image to both the language model (its span, after
+  its time as text) and the vision tower (two frames over the temporal patch), so the M-RoPE, the prefix cache and
+  the image path take videos unchanged; transformers' prompt ids and positions match
+  (`frontend/tests/test_videoproc.py`). The vision tower encodes the pairs of one grid in one pass (attention per
+  pair), bit-identical to one pair per call; one pass per pair would stream the weights 300 times for a 5-minute
+  video with `VISION=host`. The per-frame pixel cap of qwen-vl-utils (transformers' default from v5.22; without it a
+  10-second clip costs nearly the 12,288 tokens of a long video).
+- **P4-18: the checkpoint's video bounds by default, more on request.** A video takes at most 12,288 tokens and 768
+  frames by default, as the checkpoint's processor (and vLLM / transformers) does it; `VIDEO_MAX_TOKENS` /
+  `VIDEO_MAX_FRAMES` raise them for the server and `mm_processor_kwargs.size.longest_edge` for a request
+  (transformers' own key, so its plan and ids still match). The defaults stay because answers then match the
+  reference engines; on a 3-minute video at 129,857 tokens the model gave the same times as at 13,445 for two
+  scenes, but described the video without the times it was asked for.
+- **Videos decoded by the engine on NVDEC, without FFmpeg.** PyAV (FFmpeg) took the serving image from 198 to
+  369 MB and, through FFmpeg's NVDEC path (one picture at a time), was slower than its CPU decoder: NVDEC was 19 to
+  46% busy. The engine feeds the driver's parser itself with up to four pictures in flight, maps only the sampled
+  frames, and decodes the parts of a long video on both NVDEC engines; it beats 24 CPU threads 3.3 to 3.4 times on 4K
+  AV1 / HEVC. The MP4 reader is our own (about 500 lines: one video track, the sample table, fragments, edit lists);
+  a library (minimp4) lacked fragmented files, `hev1` and edit lists. Matroska / WebM goes through libwebm's
+  `mkvparser` (vendored, BSD; continuously fuzzed upstream), whose EBML parsing is not worth writing again. No CPU fallback: codecs NVDEC does not
+  decode get HTTP 400. Each pixel takes its 2x2 block's chroma, as FFmpeg's default conversion: interpolating it
+  moved colorful frames 5 to 7 steps away from what the reference readers (transformers', qwen-vl-utils') give.
+- **A video's rotation is applied, unlike transformers' default reader.** PyAV (transformers' default) returns the
+  frames as stored and leaves `frame.rotation` to the caller, so a portrait phone video reaches the model on its
+  side; FFmpeg's command line, players and browsers turn it. The engine turns it the way FFmpeg does.
+- **10-bit chroma as for 8 bits.** Each pixel takes its block's chroma sample at every bit depth. FFmpeg's 8-bit
+  conversion does the same; for 10-bit HEVC its RGB is within 1.3 steps of ours, for 10-bit H.264 (rare) it is 4 to
+  6 steps away on average by a conversion not reproduced here.
+- **NVDEC's memory lent by the KV pool, not reserved.** A decode takes up to 0.8 GiB (4K, two decoders) that the
+  driver allocates outside the plan. A fixed reserve would cost every user 6.5% of the KV cache (about 47K tokens),
+  and nothing at all leaves a full process 0.5 GiB past the budget for the decode. The KV pool is mapped through
+  CUDA's virtual memory management (available on WSL2 and on native Windows), and the server lends the blocks below
+  the parking areas for the decode's duration: unmapping 1 GiB takes 3 to 7 ms in 32 MiB chunks, does not wait for
+  running kernels, and gives the memory back to the device (NVML used drops by as much).
 
 ## Weights
 
@@ -351,6 +484,30 @@ gate without an explicit decision, recorded below with its numbers.
   Found on the way: when the pool ran out, the scheduler suspended the latest request other than the one that ran
   out, and two requests could suspend each other thousands of times. It now suspends the latest request including
   itself, and a suspended request resumes only when the KV pool has room.
+- **P6-50: what a client writes stays text.** Rendering the chat template and encoding the result (as
+  transformers, vLLM and SGLang do) turned special tokens' strings in a message into the tokens: `<|im_end|>` and
+  `<|im_start|>system` in a user message ended the turn and opened a system turn, `</tool_response>` in a tool result
+  closed it, `<|image_pad|>` counted as an image. This also happens without intent, e.g. an agent reading source
+  code that contains `<tool_call>`. The server now marks those strings in system, user and tool messages and in the
+  tool definitions before rendering, and encodes the marked parts with the same tokenizer without its added tokens
+  (`<|im_start|>` becomes `<`, `|`, `im`, ...). A prompt without such strings has the same ids as before. Assistant
+  messages keep their tokens (they are the model's own output), as does a user message that is a whole
+  `<tool_response>...</tool_response>` (the template treats it as a tool result), and `/v1/completions` prompts are
+  encoded as they are. A whole state machine over the template (llama.cpp's input marking, not used by its server)
+  was not needed: only the added tokens' strings are marked, so the template's string tests (`trim`, `startswith`)
+  see the same text. With a fake system turn asking for one word, the old encoding answered with it; the new one
+  translated the line as asked. The marking costs under 1 ms on a 200K-token prompt with 50 marked strings
+  (encoding takes about 200 ms either way).
+- **P6-51: the output parser splits on tokens, not strings.** The parser looked for `</think>`, `<tool_call>` and
+  `</tool_call>` in the decoded text, but the model writes them as ordinary tokens (`<`, `tool`, `_call`, `>`) when
+  it quotes them, and as one token each only when it means them. Asked for a function that strips `<think>`
+  sections, its reasoning ended at the first quoted `</think>` (73 characters; 3 of 3 runs); asked for a tool-call
+  parser, the code's examples came back as calls of tools that do not exist (3 of 3); asked to repeat a log that
+  contains a call, the server returned it as a call of `delete_all`, which the request did not define (6 of 6). The
+  detokenizer of the chat APIs now writes those three tokens as private-use characters, the parser splits only
+  there, and its events have the strings again. A stop string matches both forms. With it the same runs keep their
+  reasoning, code and logs as text, and the model's real calls still parse. `/v1/completions` returns the text as
+  it was.
 
 ## Not done
 
