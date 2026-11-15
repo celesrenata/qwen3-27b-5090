@@ -49,6 +49,26 @@
                 anyio = super.anyio.overridePythonAttrs {
                   doCheck = false;
                 };
+                # llguidance's checkInputs include torch and transformers; a
+                # check-running build pulls both into the closure and compiles
+                # PyTorch from source (no binary cache for the unfree CUDA build).
+                # The server only imports llguidance, so skip its test phase.
+                llguidance = super.llguidance.overridePythonAttrs {
+                  doCheck = false;
+                };
+                # Pillow 12.3.0, the version upstream pins (frontend/requirements.txt).
+                # frontend/imageproc.py resizes bit-exactly like Pillow's bicubic
+                # resize and tests/test_imageproc.py asserts it; Pillow 13 (current
+                # nixpkgs) rounds some pixels differently and fails those tests.
+                pillow = super.pillow.overridePythonAttrs (old: {
+                  version = "12.3.0";
+                  src = prev.fetchFromGitHub {
+                    owner = "python-pillow";
+                    repo = "Pillow";
+                    tag = "12.3.0";
+                    hash = "sha256-kmUlgR+f75Y8DAKKPdEbchLLgg0m95oyVP53WTQni88=";
+                  };
+                });
               };
             };
           })
@@ -57,20 +77,7 @@
 
       cuda = pkgs.cudaPackages_13_3;  # matches the dev image (nvidia/cuda:13.3.0-devel)
 
-      # CUTLASS v4.8 (sm_120a block-scaled FP4), pinned to the exact commit the engine was developed
-      # against (dev/Dockerfile arg CUTLASS_COMMIT). nixpkgs cudaPackages.cutlass (4.7.1) predates the
-      # block-scaled MMA features the engine uses, so we fetch the source directly.
-      # fetchgit (not fetchFromGitHub): GitHub's on-demand commit tarballs are byte-non-deterministic,
-      # so any pinned tarball hash eventually rots. fetchgit hashes the checked-out tree deterministically
-      # and matches how the dev Docker image provisions CUTLASS (git clone + checkout, no submodules).
-      cutlass = pkgs.fetchgit {
-        url = "https://github.com/NVIDIA/cutlass";
-        rev = "098de2a652cf8f00fd70b2df54051c7eccbb855a";
-        hash = "sha256-FiXSg6DMUAV9Gf5LOePKAwmGLVPxphq6MVwHZwwsKDM=";
-        fetchSubmodules = false;
-      };
-
-      # --- engine: C++/CUDA shared library (libq27.so) + q27-sfcheck diagnostic tool ---
+      # --- engine: C++/CUDA shared library (libq27.so); no CUTLASS, the kernels are the engine's own ---
       engine = pkgs.stdenv.mkDerivation (finalAttrs: {
         pname = "qwen38-engine";
         version = "0.1.0";
@@ -86,8 +93,6 @@
           cuda.cuda_cudart
           (lib.getOutput "static" cuda.cuda_cudart)
         ];
-
-        env.CUTLASS_DIR = cutlass;
 
         # The CMakeLists already sets CMAKE_CUDA_ARCHITECTURES=120a, CMAKE_BUILD_TYPE=Release,
         # CMAKE_CUDA_STANDARD=20. We only need to tell nixpkgs to use CMake+Ninja.
@@ -108,18 +113,16 @@
       });
 
       # --- serve: Python 3.12 environment for the frontend server ---
-      # The frontend (frontend/server.py) is a stdlib http.server; at startup it imports
-      # qwen27b.weights (torch + safetensors) and transformers.AutoTokenizer, and on image
-      # requests it imports qwen27b.vision (torch, torchvision, PIL).
-      # The C++ engine itself runs in its own process (worker.py → libq27.so) and never
-      # touches PyTorch — but the parent server process needs it to load the tokenizer.
+      # Mirrors frontend/requirements.txt (the serving image's packages): the server reads
+      # tokenizer.json with `tokenizers`, renders the chat template with jinja2, preprocesses
+      # images with pillow and compiles structured-output grammars with llguidance. No PyTorch
+      # or transformers at runtime. The engine itself runs in its own process (worker.py ->
+      # libq27.so).
       serve = pkgs.python312.withPackages (ps: with ps; [
-        torch-bin
-        torchvision-bin
-        transformers
-        safetensors
-        numpy
+        jinja2
+        llguidance
         pillow
+        tokenizers
       ]);
 
       # --- repoFiles: the Python-side source tree the server runs from at runtime ---
@@ -133,7 +136,10 @@
         installPhase = ''
           mkdir -p $out
           cp -r frontend $out/frontend
-          cp -r reference $out/reference
+          # Only the PyTorch-free modules the server imports (as the Dockerfile copies them).
+          mkdir -p $out/reference/qwen27b
+          cp reference/qwen27b/__init__.py reference/qwen27b/paths.py reference/qwen27b/image_tokens.py \
+            $out/reference/qwen27b/
           mkdir -p $out/engine
           cp -r engine/python $out/engine/python
           mkdir -p $out/bench/draft-vocab
@@ -148,10 +154,16 @@
 
       # --- checks (run by `nix flake check`) ---
 
-      # Frontend tests are pure stdlib (no torch, no GPU): the parsing and
-      # admission logic. Fast and cheap — always runs in CI.
+      # Frontend tests need only the server's packages (frontend/requirements.txt), no torch and
+      # no GPU: the parsing, sampling, structured-output and admission logic. Fast and cheap —
+      # always runs in CI.
       frontendTests = let
         pyEnv = pkgs.python312.withPackages (ps: with ps; [
+          jinja2
+          llguidance
+          numpy  # imported by tests/test_tokenizer.py and test_videoproc.py (their torch parts skip)
+          pillow
+          tokenizers
           pytest
         ]);
       in pkgs.stdenv.mkDerivation {
@@ -216,7 +228,6 @@
             pytest
           ]))
         ];
-        env.CUTLASS_DIR = cutlass;
       };
 
       # NixOS module: systemd service for the engine.

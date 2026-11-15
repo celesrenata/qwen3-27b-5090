@@ -27,15 +27,15 @@ in
     engine = mkOption {
       type = types.package;
       description = ''
-        Derivation installing libq27.so under $out/lib and the q27-sfcheck
-        tool under $out/bin (e.g. `qwen27b.packages."x86_64-linux".engine`).
+        Derivation installing libq27.so under $out/lib
+        (e.g. `qwen27b.packages."x86_64-linux".engine`).
       '';
     };
     serve = mkOption {
       type = types.package;
       description = ''
-        Python environment with torch, transformers, safetensors, numpy and
-        pillow (e.g. `qwen27b.packages."x86_64-linux".serve`).
+        Python environment with the server's packages (jinja2, llguidance,
+        pillow, tokenizers; see frontend/requirements.txt) (e.g. `qwen27b.packages."x86_64-linux".serve`).
       '';
     };
     files = mkOption {
@@ -89,9 +89,13 @@ in
       '';
     };
     spec = mkOption {
-      type = types.enum [ "dflash2" "none" ];
-      default = "dflash2";
-      description = "Speculative decode (SPEC): dflash2 or none.";
+      type = types.enum [ "dspine" "dflash2" "none" ];
+      default = "dspine";
+      description = ''
+        Speculative decode (SPEC): dspine (tencent/Qwen3.8-27B-DSpine-b16),
+        dflash2 or none. With only DFlash2 downloaded (no DSpine), the server
+        falls back to dflash2 and logs a warning.
+      '';
     };
     vision = mkOption {
       type = types.enum [ "host" "fp8" "bf16" "off" ];
