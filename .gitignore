@@ -17,3 +17,4 @@ __pycache__/
 compose.override.yaml
 .env
 /dist/
+tmp/
