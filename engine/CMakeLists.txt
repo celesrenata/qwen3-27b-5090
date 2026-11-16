@@ -56,5 +56,5 @@ if(MSVC)
   target_link_options(q27 PRIVATE "/NODEFAULTLIB:lib${Q27_UCRT}" "/DEFAULTLIB:${Q27_UCRT}")
 endif()
 
-# Nix: install the engine library (the flake and NixOS module consume lib/libq27.so)
+# Used by the nix build in flake.nix (installPhase runs cmake --install).
 install(TARGETS q27 DESTINATION lib)
